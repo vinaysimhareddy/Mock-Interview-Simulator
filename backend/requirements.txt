@@ -1,0 +1,39 @@
+# Core FastAPI & ASGI server
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+
+# Database & ODM
+motor==3.7.0
+pymongo[srv]>=4.6.0
+dnspython>=2.6.0
+certifi>=2024.0.0
+
+# Validation & Settings
+pydantic==2.10.6
+pydantic-settings==2.7.1
+email-validator==2.2.0
+
+# Security & Authentication
+pyjwt==2.10.1
+passlib[argon2]==1.7.4
+argon2-cffi==23.1.0
+python-multipart==0.0.20
+
+# PDF Document Ingestion
+pdfplumber==0.11.5
+
+# LangChain, LangGraph & LLM Providers
+langchain==0.3.18
+langchain-core==0.3.37
+langchain-community==0.3.17
+langchain-openai==0.3.6
+langchain-google-genai==2.0.10
+langgraph==0.2.73
+
+# Realtime & WebSockets
+websockets==14.2
+
+# Testing & Client
+httpx==0.28.1
+pytest==8.3.4
+pytest-asyncio==0.25.3

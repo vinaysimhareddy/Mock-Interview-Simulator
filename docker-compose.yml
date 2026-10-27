@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  # Local MongoDB Database (optional, enabled with --profile local-db)
+  mongo:
+    image: mongo:7.0
+    container_name: adaptive_interview_mongo
+    profiles:
+      - local-db
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_DATABASE=ai-mock-interview
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - interview_net
+
+  # FastAPI Backend Service with hot reload
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: adaptive_interview_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    env_file:
+      - backend/.env
+    networks:
+      - interview_net
+
+  # React + Vite Frontend Service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: adaptive_interview_frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - interview_net
+
+volumes:
+  mongo_data:
+    driver: local
+
+networks:
+  interview_net:
+    driver: bridge
