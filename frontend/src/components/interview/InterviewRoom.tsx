@@ -1,36 +1,42 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   Mic,
-  MicOff,
-  Volume2,
-  ChevronLeft,
-  Sparkles,
-  Send,
-  Award,
-  TrendingUp,
-  TrendingDown,
+  Video,
+  Pause,
+  Play,
+  HelpCircle,
+  Subtitles,
   CheckCircle2,
   AlertCircle,
-  Target,
   ArrowRight,
-  RefreshCw,
-  Play,
-  Square,
-  ShieldAlert,
   ShieldCheck,
-  Download,
+  X,
+  ArrowLeft,
+  ArrowUp,
+  ArrowDown,
+  Smile,
+  Eye,
+  Sparkles,
 } from 'lucide-react';
-import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import {
-  WebcamMonitor,
-  WebcamMonitorStatusInfo,
-  WebcamMonitorAction,
-} from './WebcamMonitor';
+import { MetricsHUD } from './MetricsHUD';
 import { CameraLostModal } from './CameraLostModal';
+import { FaceLostModal } from './FaceLostModal';
+import { HelpDrawer } from './HelpDrawer';
+import { InterviewTopBar } from './InterviewTopBar';
+import { InterviewerOrb, OrbState } from './InterviewerOrb';
+import { QuestionCaption } from './QuestionCaption';
+import { CandidateAnswerTranscript } from './CandidateAnswerTranscript';
+import { InterviewComplete } from './InterviewComplete';
+import { InterviewAborted } from './InterviewAborted';
+import { ExecutiveScorecard } from './ExecutiveScorecard';
 import { useWebSocketInterview } from '@/hooks/useWebSocketInterview';
+import { useMediaStream } from '@/context/CameraStreamContext';
+import { useMediaPipeVision } from '@/hooks/useMediaPipeVision';
+import { useVoiceTurnEngine } from '@/hooks/useVoiceTurnEngine';
 import { TelemetrySample, ServerWSMessage, FinalReport } from '@/lib/types';
+import { ChallengeActionType, LivenessChallengeStep } from '@/lib/integrityTypes';
 import { apiClient, ApiError } from '@/lib/api';
 import { SessionData } from './InterviewConfigurator';
 
@@ -55,31 +61,108 @@ interface InterviewStepResponse {
   final_report?: FinalReport;
 }
 
-interface InterviewRoomProps {
+export type RoomPhase = 'live' | 'wrapping_up' | 'complete' | 'scorecard' | 'aborted';
+
+export interface InterviewRoomProps {
   session: SessionData;
   token: string;
   durationMinutes?: number;
+  initialQuestion?: string;
+  initialPhase?: RoomPhase;
+  initialReport?: FinalReport;
   onExit: () => void;
+  onOpenHelp?: () => void;
 }
 
 export function InterviewRoom({
   session,
   token,
-  durationMinutes: _durationMinutes = 15,
+  durationMinutes = 15,
+  initialQuestion,
+  initialPhase,
+  initialReport,
   onExit,
+  onOpenHelp,
 }: InterviewRoomProps): React.ReactElement {
-  // Camera integrity & edge case recovery states (§5)
+  const [roomPhase, setRoomPhase] = useState<RoomPhase>(
+    initialPhase || (initialReport ? 'complete' : 'live')
+  );
+  const [abortReason, setAbortReason] = useState<string>('user_ended');
+  const [isGeneratingReport, setIsGeneratingReport] = useState<boolean>(false);
+
+  // Query parameter developer flag (?debug=1)
+  const isDebugMode = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    return new URLSearchParams(window.location.search).get('debug') === '1';
+  }, []);
+
+  // Candidate Captions & Transcript flag (defaults to ON for accessible live speech feedback §Q6)
+  const [showCandidateCaptions, setShowCandidateCaptions] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true;
+    const stored = localStorage.getItem('SHOW_CANDIDATE_CAPTIONS');
+    if (stored !== null) return stored === 'true';
+    return true; // Default to ON so candidate sees live transcript without having to discover toggle (§Q6)
+  });
+
+  // User pause state
+  const [isUserPaused, setIsUserPaused] = useState<boolean>(false);
+
+  // Help Drawer state (§3.4)
+  const [isHelpDrawerOpen, setIsHelpDrawerOpen] = useState<boolean>(false);
+
+  // Face absence monitoring state (§3.5)
+  const [faceMissingSeconds, setFaceMissingSeconds] = useState<number>(0);
+  const [isFaceLostModalOpen, setIsFaceLostModalOpen] = useState<boolean>(false);
+  const [hasRepeatedCurrentQuestion, setHasRepeatedCurrentQuestion] = useState<boolean>(false);
+
+  // Time budget countdown
+  const [remainingSeconds, setRemainingSeconds] = useState<number>(durationMinutes * 60);
+
+  // Camera integrity & recovery states
   const [isCameraLostModalOpen, setIsCameraLostModalOpen] = useState<boolean>(false);
   const [cameraLostReason, setCameraLostReason] = useState<string>(
     'Camera feed disconnected or obstructed.'
   );
   const [cameraLostGraceSec, setCameraLostGraceSec] = useState<number>(30);
   const [isPausedByIntegrity, setIsPausedByIntegrity] = useState<boolean>(false);
-  const [integrityStatusInfo, setIntegrityStatusInfo] = useState<WebcamMonitorStatusInfo | null>(
-    null
-  );
-  const webcamActionRef = useRef<WebcamMonitorAction | null>(null);
 
+  // Shared MediaStream from provider (Invariant 5)
+  const { videoStream, activeCameraLabel, audioStream, stopAll } = useMediaStream();
+  const [showSelfView, setShowSelfView] = useState<boolean>(false);
+  const selfViewVideoRef = useRef<HTMLVideoElement>(null);
+  const [_latestTelemetry, setLatestTelemetry] = useState<TelemetrySample | null>(null);
+
+  // Ref to hold trigger for active liveness challenge
+  const challengeTriggerRef = useRef<
+    ((stepsOrCount?: number | LivenessChallengeStep | LivenessChallengeStep[]) => void) | null
+  >(null);
+
+  // Active liveness challenge modal state
+  const [activeChallengeStep, setActiveChallengeStep] = useState<LivenessChallengeStep | null>(null);
+  const [challengeRemainingSec, setChallengeRemainingSec] = useState<number>(8.0);
+  const [challengeNotification, setChallengeNotification] = useState<{
+    type: 'success' | 'error';
+    message: string;
+  } | null>(null);
+  const challengeVideoRef = useRef<HTMLVideoElement>(null);
+
+  // Question & Session progression states
+  const [currentQuestion, setCurrentQuestion] = useState<string>(initialQuestion || '');
+  const [questionIndex, setQuestionIndex] = useState<number>(1);
+  const [_maxQuestions, setMaxQuestions] = useState<number>(5);
+  const [_currentDifficulty, setCurrentDifficulty] = useState<string>(session.difficulty);
+  const [_lastDifficultyChange, setLastDifficultyChange] = useState<string | null>(null);
+  const [_lastEvaluation, setLastEvaluation] = useState<QuestionEvaluation | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [isInitializing, setIsInitializing] = useState<boolean>(true);
+  const [finalReport, setFinalReport] = useState<FinalReport | null>(initialReport || null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState<boolean>(false);
+
+  // 15s no-speech countdown state (shown in final 5s only)
+  const [noSpeechRemaining, setNoSpeechRemaining] = useState<number | null>(null);
+
+  // Handle incoming WebSocket messages
   const handleWSMessage = useCallback((message: ServerWSMessage) => {
     if (message.type === 'pause_integrity') {
       setIsCameraLostModalOpen(true);
@@ -96,12 +179,6 @@ export function InterviewRoom({
         utterance.rate = 1.0;
         window.speechSynthesis.speak(utterance);
       }
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.stop();
-        } catch {}
-        setIsRecordingAnswer(false);
-      }
     } else if (message.type === 'resume_integrity') {
       setIsCameraLostModalOpen(false);
       setIsPausedByIntegrity(false);
@@ -112,21 +189,34 @@ export function InterviewRoom({
         window.speechSynthesis.speak(utterance);
       }
     } else if (message.type === 'challenge') {
+      const step: LivenessChallengeStep = {
+        id: message.challenge_id,
+        action: message.action as ChallengeActionType,
+        prompt: message.prompt,
+        nonce: message.nonce,
+        timeoutMs: (message.timeout_sec ?? 8.0) * 1000,
+      };
+      setActiveChallengeStep(step);
+      setChallengeRemainingSec(message.timeout_sec ?? 8.0);
+      setChallengeNotification(null);
+
       if ('speechSynthesis' in window) {
         window.speechSynthesis.cancel();
         const utterance = new SpeechSynthesisUtterance(message.prompt);
         utterance.rate = 1.0;
         window.speechSynthesis.speak(utterance);
       }
-      if (webcamActionRef.current) {
-        webcamActionRef.current.startChallenge(1);
+      if (challengeTriggerRef.current) {
+        challengeTriggerRef.current(step);
       }
     }
   }, []);
 
   const {
-    status: wsStatus,
+    status: _wsStatus,
     send: sendWSMessage,
+    sendTelemetry: sendWSTelemetry,
+    ackedPacketCount,
   } = useWebSocketInterview({
     sessionId: session.id,
     token: token,
@@ -134,58 +224,481 @@ export function InterviewRoom({
     onMessage: handleWSMessage,
   });
 
-  const [packetCount, setPacketCount] = useState<number>(0);
-  const [_latestTelemetry, setLatestTelemetry] = useState<TelemetrySample | null>(null);
-
-  const handleTelemetryPacket = (sample: TelemetrySample) => {
+  const handleTelemetryPacket = useCallback((sample: TelemetrySample) => {
     setLatestTelemetry(sample);
-    setPacketCount((prev) => prev + 1);
-    sendWSMessage(sample);
-  };
+    void sendWSTelemetry(sample, {
+      cameraLabel: activeCameraLabel,
+    });
+  }, [sendWSTelemetry, activeCameraLabel]);
 
-  const handleIntegrityStatusChange = useCallback((info: WebcamMonitorStatusInfo) => {
-    setIntegrityStatusInfo(info);
-    if (info.status === 'error') {
-      setIsCameraLostModalOpen(true);
-      setCameraLostReason(info.error || 'Camera feed disconnected or permission revoked.');
-      setIsPausedByIntegrity(true);
-      if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-        const utterance = new SpeechSynthesisUtterance('Camera lost, please restore it');
-        utterance.rate = 1.0;
-        window.speechSynthesis.speak(utterance);
+  // MediaPipe Vision Hook wired directly to shared videoStream in background
+  const {
+    status: visionStatus,
+    error: visionError,
+    videoRef: backgroundVideoRef,
+    canvasRef: backgroundCanvasRef,
+    latestMetrics,
+    activeIntegrityFlags: _activeIntegrityFlags,
+    isPhysicalVerified: _isPhysicalVerified,
+    availableCameras,
+    selectedDeviceId,
+    selectCamera,
+    start: restoreVision,
+    startChallenge,
+    resetChallenge,
+    challengeStatus,
+    challengeScore,
+  } = useMediaPipeVision({
+    stream: videoStream,
+    autoStart: true,
+    onTelemetryPacket: handleTelemetryPacket,
+    onIntegrityEvent: (event) => {
+      if (
+        event.type === 'track_ended' ||
+        event.type === 'frozen_feed' ||
+        event.type === 'track_muted'
+      ) {
+        setIsCameraLostModalOpen(true);
+        setCameraLostReason(
+          event.type === 'frozen_feed'
+            ? 'Camera video feed froze or failed to deliver frames.'
+            : event.type === 'track_muted'
+            ? 'Camera track was muted by hardware or system.'
+            : 'Camera feed disconnected or hardware track ended.'
+        );
+        setIsPausedByIntegrity(true);
+        if ('speechSynthesis' in window) {
+          window.speechSynthesis.cancel();
+          const utterance = new SpeechSynthesisUtterance(
+            'Camera feed lost. Please restore camera within 30 seconds.'
+          );
+          utterance.rate = 1.0;
+          window.speechSynthesis.speak(utterance);
+        }
+      } else if (event.type === 'feed_resumed' || event.type === 'track_unmuted') {
+        setIsCameraLostModalOpen(false);
+        setIsPausedByIntegrity(false);
+        if ('speechSynthesis' in window) {
+          window.speechSynthesis.cancel();
+          const utterance = new SpeechSynthesisUtterance(
+            'Camera feed restored. Resuming interview.'
+          );
+          utterance.rate = 1.0;
+          window.speechSynthesis.speak(utterance);
+        }
       }
+    },
+    onAntiSpoofFlag: (flag) => {
+      if (flag.flag === 'camera_covered') {
+        setIsCameraLostModalOpen(true);
+        setCameraLostReason('Camera lens covered or blocked.');
+        setIsPausedByIntegrity(true);
+      }
+    },
+    onChallengeComplete: (result) => {
+      sendWSMessage({
+        type: 'challenge_result',
+        challenge_id: result.challengeId,
+        nonce: result.nonce,
+        passed: result.passed,
+        score: result.score,
+      });
+
+      if (result.passed) {
+        setChallengeNotification({
+          type: 'success',
+          message: 'Liveness verified! Physical presence confirmed.',
+        });
+        setTimeout(() => {
+          resetChallenge();
+          setActiveChallengeStep(null);
+          setChallengeNotification(null);
+        }, 1400);
+      } else {
+        setChallengeNotification({
+          type: 'error',
+          message: 'Challenge timed out. Verifying with server policy engine...',
+        });
+        setTimeout(() => {
+          resetChallenge();
+          setActiveChallengeStep(null);
+          setChallengeNotification(null);
+        }, 2200);
+      }
+    },
+  });
+
+  useEffect(() => {
+    challengeTriggerRef.current = startChallenge;
+  }, [startChallenge]);
+
+  // Challenge countdown timer and video attachment
+  useEffect(() => {
+    if (!activeChallengeStep || challengeStatus !== 'in_progress') return;
+
+    const interval = setInterval(() => {
+      setChallengeRemainingSec((prev) => {
+        const next = Math.max(0, prev - 0.1);
+        return parseFloat(next.toFixed(1));
+      });
+    }, 100);
+
+    return () => clearInterval(interval);
+  }, [activeChallengeStep, challengeStatus]);
+
+  useEffect(() => {
+    if (activeChallengeStep && challengeVideoRef.current && videoStream) {
+      challengeVideoRef.current.srcObject = videoStream;
+      challengeVideoRef.current.play().catch(() => {});
     }
-  }, []);
+  }, [activeChallengeStep, videoStream]);
+
+  useEffect(() => {
+    if (visionStatus === 'error') {
+      setIsCameraLostModalOpen(true);
+      setCameraLostReason(visionError || 'Camera feed disconnected or permission revoked.');
+      setIsPausedByIntegrity(true);
+    }
+  }, [visionStatus, visionError]);
+
+  useEffect(() => {
+    if (showSelfView && selfViewVideoRef.current && videoStream) {
+      selfViewVideoRef.current.srcObject = videoStream;
+      selfViewVideoRef.current.play().catch(() => {});
+    }
+  }, [showSelfView, videoStream]);
 
   const handleRestoreCamera = async () => {
-    if (webcamActionRef.current) {
-      await webcamActionRef.current.restore();
+    try {
+      await restoreVision();
+      setIsCameraLostModalOpen(false);
+      setIsPausedByIntegrity(false);
+      sendWSMessage({
+        type: 'integrity_event',
+        event_type: 'camera_restored',
+        t: Math.max(
+          0,
+          parseFloat(
+            (
+              (Date.now() -
+                (session.created_at ? new Date(session.created_at).getTime() : Date.now())) /
+              1000
+            ).toFixed(3)
+          )
+        ),
+      });
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(
+          new SpeechSynthesisUtterance('Camera feed restored. Resuming interview.')
+        );
+      }
+    } catch (err) {
+      console.error('Failed to restore camera:', err);
     }
   };
+
+  // Wrap-up Flow (§3.7): Natural spoken closing line, stage fade, tracks stopped via stopAll()
+  const handleWrapUp = useCallback(
+    (report?: FinalReport) => {
+      setRoomPhase('wrapping_up');
+      if (report) {
+        setFinalReport(report);
+      } else {
+        setIsGeneratingReport(true);
+        apiClient
+          .get<FinalReport>(`/api/v1/interview/sessions/${session.id}/report`)
+          .then((rep) => setFinalReport(rep))
+          .catch(() => {})
+          .finally(() => setIsGeneratingReport(false));
+      }
+
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        const closingUtterance = new SpeechSynthesisUtterance(
+          'That concludes our interview today. Thank you for your time and thoughtful responses.'
+        );
+        closingUtterance.rate = 1.0;
+        closingUtterance.onend = () => {
+          stopAll();
+          setRoomPhase('complete');
+        };
+        window.speechSynthesis.speak(closingUtterance);
+        setTimeout(() => {
+          stopAll();
+          setRoomPhase('complete');
+        }, 2600);
+      } else {
+        stopAll();
+        setRoomPhase('complete');
+      }
+    },
+    [session.id, stopAll]
+  );
 
   const handleGraceExpired = () => {
     sendWSMessage({ type: 'end_interview', reason: 'aborted_camera_lost' });
-    setErrorMessage(
-      'Interview aborted: Physical camera feed was not restored within the 30-second grace window.'
-    );
+    stopAll();
     setIsCameraLostModalOpen(false);
     setIsPausedByIntegrity(true);
+    setAbortReason('aborted_camera_lost');
+    setRoomPhase('aborted');
   };
 
-  // LangGraph interview engine state
-  const [currentQuestion, setCurrentQuestion] = useState<string>('');
-  const [questionIndex, setQuestionIndex] = useState<number>(1);
-  const [maxQuestions, setMaxQuestions] = useState<number>(5);
-  const [currentDifficulty, setCurrentDifficulty] = useState<string>(session.difficulty);
-  const [lastDifficultyChange, setLastDifficultyChange] = useState<string | null>(null);
-  const [lastEvaluation, setLastEvaluation] = useState<QuestionEvaluation | null>(null);
-  const [candidateAnswer, setCandidateAnswer] = useState<string>('');
-  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
-  const [isInitializing, setIsInitializing] = useState<boolean>(true);
-  const [finalReport, setFinalReport] = useState<FinalReport | null>(null);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [isGeneratingPdf, setIsGeneratingPdf] = useState<boolean>(false);
+  // Remaining duration countdown timer
+  useEffect(() => {
+    if (isUserPaused || isPausedByIntegrity || roomPhase !== 'live') return;
+
+    const interval = setInterval(() => {
+      setRemainingSeconds((prev) => {
+        if (prev <= 1) {
+          clearInterval(interval);
+          sendWSMessage({ type: 'end_interview', reason: 'time_budget_expired' });
+          handleWrapUp();
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isUserPaused, isPausedByIntegrity, roomPhase, sendWSMessage, handleWrapUp]);
+
+  // Spacebar shortcut to toggle Pause/Resume
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      if (e.code === 'Space') {
+        e.preventDefault();
+        setIsUserPaused((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // Answer submission pipeline
+  const executeAnswerSubmission = useCallback(async (answerText: string) => {
+    const trimmed = answerText.trim();
+    if (!trimmed || isSubmitting) return;
+
+    setIsSubmitting(true);
+    setErrorMessage(null);
+
+    // Section 3.6: Latency hiding conversational acknowledgement (deterministic based on turn index)
+    if ('speechSynthesis' in window && !isUserPaused && !isPausedByIntegrity) {
+      const acks = [
+        'Got it.',
+        'Understood, thank you.',
+        "Thanks, that's helpful.",
+        'Noted.',
+      ];
+      const deterministicAck = acks[questionIndex % acks.length];
+      const ackUtterance = new SpeechSynthesisUtterance(deterministicAck);
+      ackUtterance.rate = 1.1;
+      window.speechSynthesis.speak(ackUtterance);
+    }
+
+    try {
+      const res = await apiClient.post<InterviewStepResponse>(
+        `/api/v1/interview/sessions/${session.id}/answer`,
+        { answer: trimmed }
+      );
+
+      if (res.evaluation) {
+        setLastEvaluation(res.evaluation);
+      }
+      if (res.difficulty_change && res.difficulty_change !== 'UNCHANGED') {
+        setLastDifficultyChange(res.difficulty_change);
+      }
+      setCurrentDifficulty(res.difficulty);
+
+      if (res.status === 'COMPLETED' || res.final_report) {
+        handleWrapUp(res.final_report);
+      } else if (res.next_question) {
+        setCurrentQuestion(res.next_question);
+        setQuestionIndex(res.current_question_index);
+      }
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : 'Failed to evaluate response.';
+      setErrorMessage(msg);
+    } finally {
+      setIsSubmitting(false);
+    }
+  }, [session.id, isSubmitting, isUserPaused, isPausedByIntegrity, questionIndex, handleWrapUp]);
+
+  // Voice Turn Engine
+  const isOverallPaused =
+    isUserPaused ||
+    isPausedByIntegrity ||
+    isCameraLostModalOpen ||
+    isFaceLostModalOpen ||
+    isHelpDrawerOpen ||
+    Boolean(activeChallengeStep && challengeStatus === 'in_progress');
+
+  const {
+    turnState,
+    isAiSpeaking,
+    isCandidateSpeaking,
+    isListening,
+    transcript,
+    interimTranscript,
+    audioLevel,
+    silenceProgress,
+    isSpeechSupported,
+    sttError,
+    clearTranscript,
+    setTranscript,
+    speakQuestion: speakCurrentQuestion,
+    stopAudio: _stopAudio,
+    interruptAI: _interruptAI,
+    submitAnswer: _completeVoiceAnswer,
+  } = useVoiceTurnEngine({
+    audioStream,
+    currentQuestion,
+    questionIndex,
+    isPaused: isOverallPaused,
+    sendWSMessage,
+    onSubmitAnswer: executeAnswerSubmission,
+    autoPlayTTS: true,
+    silenceTimeoutMs: 2200,
+    minSpeechDurationMs: 400,
+  });
+
+  // Reset repeat question allowance on new question
+  useEffect(() => {
+    setHasRepeatedCurrentQuestion(false);
+  }, [currentQuestion]);
+
+  const handleRepeatQuestion = useCallback(() => {
+    if (hasRepeatedCurrentQuestion || !currentQuestion) return;
+    setHasRepeatedCurrentQuestion(true);
+    void speakCurrentQuestion();
+  }, [hasRepeatedCurrentQuestion, currentQuestion, speakCurrentQuestion]);
+
+  const handleRetryCamera = useCallback(async () => {
+    try {
+      await restoreVision();
+    } catch (e) {
+      console.error('Failed to retry camera:', e);
+    }
+  }, [restoreVision]);
+
+  const handleRetryMic = useCallback(async () => {
+    try {
+      if (audioStream) {
+        audioStream.getTracks().forEach((t) => t.stop());
+      }
+    } catch (e) {
+      console.error('Failed to retry mic:', e);
+    }
+  }, [audioStream]);
+
+  // Continuous face absence detection (§3.5)
+  useEffect(() => {
+    if (isInitializing || Boolean(finalReport)) return;
+
+    if (!latestMetrics.facePresent) {
+      const interval = setInterval(() => {
+        setFaceMissingSeconds((prev) => {
+          const next = prev + 0.5;
+          if (next >= 3.0 && !isFaceLostModalOpen) {
+            setIsFaceLostModalOpen(true);
+          }
+          if (next >= 10.0 && prev < 10.0 && 'speechSynthesis' in window) {
+            window.speechSynthesis.cancel();
+            window.speechSynthesis.speak(
+              new SpeechSynthesisUtterance('Warning 1 of 2: Face not detected. Please return to camera frame.')
+            );
+          }
+          if (next >= 20.0 && prev < 20.0 && 'speechSynthesis' in window) {
+            window.speechSynthesis.cancel();
+            window.speechSynthesis.speak(
+              new SpeechSynthesisUtterance('Warning 2 of 2: Final notice. Continued face absence will end the interview.')
+            );
+          }
+          if (next >= 30.0) {
+            clearInterval(interval);
+            sendWSMessage({ type: 'end_interview', reason: 'aborted_face_not_visible' });
+            stopAll();
+            setErrorMessage('Interview ended: Face was not visible for 30 consecutive seconds.');
+            setIsFaceLostModalOpen(false);
+            setAbortReason('aborted_face_not_visible');
+            setRoomPhase('aborted');
+          }
+          return next;
+        });
+      }, 500);
+      return () => clearInterval(interval);
+    } else {
+      setFaceMissingSeconds(0);
+      setIsFaceLostModalOpen(false);
+    }
+  }, [latestMetrics.facePresent, isInitializing, finalReport, isFaceLostModalOpen, sendWSMessage]);
+
+  // 15-second no-speech timer (Section 3.6: 15s no-speech advances to next question)
+  useEffect(() => {
+    if (
+      turnState !== 'candidate_turn' ||
+      isCandidateSpeaking ||
+      transcript.trim().length > 0 ||
+      isOverallPaused ||
+      !currentQuestion
+    ) {
+      setNoSpeechRemaining(null);
+      return;
+    }
+
+    const startTime = Date.now();
+    const interval = setInterval(() => {
+      const elapsedSec = (Date.now() - startTime) / 1000;
+      const left = Math.max(0, 15 - elapsedSec);
+
+      // Only reveal timer ring during final 5s to eliminate unnecessary anxiety
+      if (left <= 5) {
+        setNoSpeechRemaining(Math.ceil(left));
+      } else {
+        setNoSpeechRemaining(null);
+      }
+
+      if (left <= 0) {
+        clearInterval(interval);
+        if ('speechSynthesis' in window) {
+          const skipMsg = new SpeechSynthesisUtterance("Let's move on to the next question.");
+          window.speechSynthesis.speak(skipMsg);
+        }
+        void executeAnswerSubmission('No response provided (timed out).');
+      }
+    }, 400);
+
+    return () => clearInterval(interval);
+  }, [turnState, isCandidateSpeaking, transcript, isOverallPaused, currentQuestion, executeAnswerSubmission]);
+
+  // Initialize session workflow
+  useEffect(() => {
+    async function initInterviewEngine() {
+      setIsInitializing(true);
+      setErrorMessage(null);
+      try {
+        const res = await apiClient.post<InterviewStepResponse>(
+          `/api/v1/interview/sessions/${session.id}/start`
+        );
+        const q = res.next_question || 'Ready to begin.';
+        setCurrentQuestion(q);
+        setQuestionIndex(res.current_question_index);
+        setMaxQuestions(res.max_questions);
+        setCurrentDifficulty(res.difficulty);
+      } catch (err) {
+        if (!initialQuestion) {
+          const msg = err instanceof ApiError ? err.message : 'Failed to launch interview workflow.';
+          setErrorMessage(msg);
+        }
+      } finally {
+        setIsInitializing(false);
+      }
+    }
+    initInterviewEngine();
+  }, [session.id]);
 
   const handleDownloadPdf = async () => {
     if (!finalReport) return;
@@ -209,674 +722,555 @@ export function InterviewRoom({
     }
   };
 
-  // TTS & STT States
-  const [isSpeakingQuestion, setIsSpeakingQuestion] = useState<boolean>(false);
-  const [isRecordingAnswer, setIsRecordingAnswer] = useState<boolean>(false);
-  const recognitionRef = useRef<any>(null);
+  // Determine Orb visual state
+  const orbState: OrbState = useMemo(() => {
+    if (isAiSpeaking) return 'speaking';
+    if (isSubmitting || isInitializing) return 'thinking';
+    if (turnState === 'candidate_turn') return 'listening';
+    return 'idle';
+  }, [isAiSpeaking, isSubmitting, isInitializing, turnState]);
 
-  useEffect(() => {
-    return () => {
-      if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-      }
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.stop();
-        } catch {}
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    async function initInterviewEngine() {
-      setIsInitializing(true);
-      setErrorMessage(null);
-      try {
-        const res = await apiClient.post<InterviewStepResponse>(
-          `/api/v1/interview/sessions/${session.id}/start`
-        );
-        const q = res.next_question || 'Ready to begin.';
-        setCurrentQuestion(q);
-        setQuestionIndex(res.current_question_index);
-        setMaxQuestions(res.max_questions);
-        setCurrentDifficulty(res.difficulty);
-      } catch (err) {
-        const msg = err instanceof ApiError ? err.message : 'Failed to launch interview workflow.';
-        setErrorMessage(msg);
-      } finally {
-        setIsInitializing(false);
-      }
+  // State hint text
+  const stateHint = useMemo(() => {
+    if (isUserPaused) return 'Interview paused • Press Space or click Resume to continue';
+    if (isPausedByIntegrity) return 'Camera feed lost • Please restore camera';
+    if (isInitializing) return 'Connecting to your AI Interviewer...';
+    if (isSubmitting) return 'Processing your response...';
+    if (isAiSpeaking) return 'AI Interviewer speaking...';
+    if (turnState === 'candidate_turn') {
+      if (isCandidateSpeaking) return 'Listening to your response...';
+      if (silenceProgress > 0) return 'Detected pause • Concluding answer turn...';
+      if (noSpeechRemaining !== null) return `Take your time (${noSpeechRemaining}s)`;
+      return 'Listening… Take your time';
     }
-    initInterviewEngine();
-  }, [session.id]);
+    return 'Ready';
+  }, [
+    isUserPaused,
+    isPausedByIntegrity,
+    isInitializing,
+    isSubmitting,
+    isAiSpeaking,
+    turnState,
+    isCandidateSpeaking,
+    silenceProgress,
+    noSpeechRemaining,
+  ]);
 
-  const handleToggleSpeech = () => {
-    if (!('speechSynthesis' in window)) return;
-
-    if (isSpeakingQuestion) {
-      window.speechSynthesis.cancel();
-      setIsSpeakingQuestion(false);
-    } else {
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(currentQuestion);
-      utterance.rate = 1.0;
-      utterance.pitch = 1.0;
-      utterance.onend = () => setIsSpeakingQuestion(false);
-      utterance.onerror = () => setIsSpeakingQuestion(false);
-      setIsSpeakingQuestion(true);
-      window.speechSynthesis.speak(utterance);
-    }
-  };
-
-  const handleToggleDictation = () => {
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-      setErrorMessage('Speech recognition is not supported in this browser. Please type your response.');
-      return;
-    }
-
-    if (isRecordingAnswer) {
-      if (recognitionRef.current) {
-        recognitionRef.current.stop();
-      }
-      setIsRecordingAnswer(false);
-    } else {
-      try {
-        const recognition = new SpeechRecognition();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.lang = 'en-US';
-
-        recognition.onresult = (event: any) => {
-          let transcript = '';
-          for (let i = event.resultIndex; i < event.results.length; i++) {
-            transcript += event.results[i][0].transcript;
-          }
-          setCandidateAnswer((prev) => {
-            const trimmed = prev.trim();
-            return trimmed ? `${trimmed} ${transcript}` : transcript;
-          });
-        };
-
-        recognition.onerror = () => {
-          setIsRecordingAnswer(false);
-        };
-
-        recognition.onend = () => {
-          setIsRecordingAnswer(false);
-        };
-
-        recognitionRef.current = recognition;
-        recognition.start();
-        setIsRecordingAnswer(true);
-      } catch {
-        setIsRecordingAnswer(false);
-      }
-    }
-  };
-
-  const handleSubmitAnswer = async () => {
-    if (!candidateAnswer.trim() || isSubmitting) return;
-
-    if (isRecordingAnswer && recognitionRef.current) {
-      recognitionRef.current.stop();
-      setIsRecordingAnswer(false);
-    }
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-      setIsSpeakingQuestion(false);
-    }
-
-    setIsSubmitting(true);
-    setErrorMessage(null);
-    try {
-      const res = await apiClient.post<InterviewStepResponse>(
-        `/api/v1/interview/sessions/${session.id}/answer`,
-        { answer: candidateAnswer.trim() }
-      );
-
-      if (res.evaluation) {
-        setLastEvaluation(res.evaluation);
-      }
-      if (res.difficulty_change && res.difficulty_change !== 'UNCHANGED') {
-        setLastDifficultyChange(res.difficulty_change);
-      }
-      setCurrentDifficulty(res.difficulty);
-
-      if (res.status === 'COMPLETED' || res.final_report) {
-        setFinalReport(res.final_report || null);
-      } else if (res.next_question) {
-        setCurrentQuestion(res.next_question);
-        setQuestionIndex(res.current_question_index);
-        setCandidateAnswer('');
-      }
-    } catch (err) {
-      const msg = err instanceof ApiError ? err.message : 'Failed to evaluate response.';
-      setErrorMessage(msg);
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  if (finalReport) {
+  // Screen 1: Interview Aborted Screen
+  if (roomPhase === 'aborted') {
     return (
-      <div className="w-full max-w-4xl mx-auto space-y-6 animate-in fade-in py-8">
-        <Card className="border-indigo-800/80 bg-slate-900/95 shadow-2xl backdrop-blur-xl">
-          <CardHeader className="text-center pb-6 border-b border-slate-800">
-            <div className="mx-auto p-3.5 rounded-2xl bg-indigo-600/20 border border-indigo-500/40 text-indigo-400 w-fit mb-2">
-              <Award className="h-8 w-8" />
-            </div>
-            <CardTitle className="text-2xl text-white font-bold">
-              Interview Completed: Executive Scorecard
-            </CardTitle>
-            <CardDescription className="text-slate-400 text-xs font-mono">
-              Role: {session.seniority} {session.role} • Evaluated by LangGraph Adaptive Engine
-            </CardDescription>
+      <div className="min-h-screen w-full flex flex-col bg-background text-foreground">
+        <InterviewAborted
+          role={session.role}
+          seniority={session.seniority}
+          reason={abortReason}
+          onReturnHome={onExit}
+          onRestartSession={onExit}
+        />
+      </div>
+    );
+  }
 
-            <div className="flex items-center justify-center gap-4 pt-4">
-              <div className="text-center px-6 py-2.5 rounded-xl bg-slate-950 border border-slate-800">
-                <span className="text-[11px] text-slate-500 uppercase tracking-wider block font-medium">
-                  Overall Score
-                </span>
-                <span className="text-3xl font-extrabold text-white font-mono">
-                  {finalReport.overall_score}
-                  <span className="text-xs text-slate-400 font-normal">/100</span>
-                </span>
-              </div>
+  // Screen 2: Interview Complete (Preliminary Handoff Screen)
+  if (roomPhase === 'complete') {
+    return (
+      <div className="min-h-screen w-full flex flex-col bg-background text-foreground">
+        <InterviewComplete
+          role={session.role}
+          seniority={session.seniority}
+          isGeneratingReport={isGeneratingReport || !finalReport}
+          hasReport={Boolean(finalReport)}
+          onViewReport={() => setRoomPhase('scorecard')}
+          onDownloadPdf={finalReport ? handleDownloadPdf : undefined}
+          isDownloadingPdf={isGeneratingPdf}
+          onReturnHome={onExit}
+        />
+      </div>
+    );
+  }
 
-              <div className="text-center px-6 py-2.5 rounded-xl bg-slate-950 border border-slate-800">
-                <span className="text-[11px] text-slate-500 uppercase tracking-wider block font-medium">
-                  Recommendation
-                </span>
-                <span className="text-xl font-bold text-emerald-400 font-mono mt-0.5 block">
-                  {finalReport.hiring_recommendation}
-                </span>
-              </div>
-            </div>
-          </CardHeader>
-
-          <CardContent className="space-y-6 pt-6">
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800 text-center space-y-1">
-                <span className="text-xs text-slate-400">Technical Depth (60%)</span>
-                <p className="text-xl font-bold text-indigo-300 font-mono">
-                  {finalReport.category_scores.technical}%
-                </p>
-              </div>
-              <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800 text-center space-y-1">
-                <span className="text-xs text-slate-400">Communication (25%)</span>
-                <p className="text-xl font-bold text-sky-300 font-mono">
-                  {finalReport.category_scores.communication}%
-                </p>
-              </div>
-              <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800 text-center space-y-1">
-                <span className="text-xs text-slate-400">Biometric Composure (15%)</span>
-                <p className="text-xl font-bold text-emerald-300 font-mono">
-                  {finalReport.category_scores.composure}%
-                </p>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div className="p-4 rounded-xl bg-emerald-950/20 border border-emerald-900/40 space-y-2">
-                <span className="text-xs font-semibold text-emerald-300 flex items-center gap-1.5">
-                  <CheckCircle2 className="h-4 w-4 text-emerald-400" />
-                  Key Strengths
-                </span>
-                <ul className="text-xs text-slate-300 space-y-1.5 list-disc list-inside">
-                  {finalReport.strengths.map((str, i) => (
-                    <li key={i}>{str}</li>
-                  ))}
-                </ul>
-              </div>
-
-              <div className="p-4 rounded-xl bg-amber-950/20 border border-amber-900/40 space-y-2">
-                <span className="text-xs font-semibold text-amber-300 flex items-center gap-1.5">
-                  <AlertCircle className="h-4 w-4 text-amber-400" />
-                  Growth Opportunities
-                </span>
-                <ul className="text-xs text-slate-300 space-y-1.5 list-disc list-inside">
-                  {finalReport.weaknesses.map((w, i) => (
-                    <li key={i}>{w}</li>
-                  ))}
-                </ul>
-              </div>
-            </div>
-
-            <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-300 leading-relaxed">
-              <span className="font-semibold text-slate-200 block mb-1">Executive Summary:</span>
-              {finalReport.executive_summary}
-            </div>
-
-            {/* SECTION 7: CAMERA INTEGRITY & BIOMETRIC VERIFICATION REPORT */}
-            <div className="p-5 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-4">
-              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 border-b border-slate-800/80 pb-3">
-                <div className="flex items-center gap-2.5">
-                  <div className="p-2 rounded-lg bg-indigo-950/60 border border-indigo-700/50 text-indigo-400">
-                    <ShieldCheck className="h-5 w-5" />
-                  </div>
-                  <div>
-                    <h4 className="text-sm font-bold text-white tracking-wide">
-                      Physical Camera Integrity & Biometric Verification (§7)
-                    </h4>
-                    <p className="text-[11px] text-slate-400">
-                      Validated by client-side WebAssembly heuristics and server plausibility checks
-                    </p>
-                  </div>
-                </div>
-                <Badge
-                  className={
-                    (finalReport.integrity_summary?.verdict || 'Verified') === 'Verified'
-                      ? 'bg-emerald-950/80 text-emerald-300 border-emerald-600/50 text-xs px-3 py-1 gap-1.5'
-                      : finalReport.integrity_summary?.verdict === 'Verified with warnings'
-                      ? 'bg-amber-950/80 text-amber-300 border-amber-600/50 text-xs px-3 py-1 gap-1.5'
-                      : 'bg-rose-950/80 text-rose-300 border-rose-600/50 text-xs px-3 py-1 gap-1.5'
-                  }
-                >
-                  <span
-                    className={`h-2 w-2 rounded-full ${
-                      (finalReport.integrity_summary?.verdict || 'Verified') === 'Verified'
-                        ? 'bg-emerald-400'
-                        : finalReport.integrity_summary?.verdict === 'Verified with warnings'
-                        ? 'bg-amber-400'
-                        : 'bg-rose-500'
-                    }`}
-                  />
-                  Verdict: {finalReport.integrity_summary?.verdict || 'Verified'}
-                </Badge>
-              </div>
-
-              {/* Metric Grid */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
-                <div className="p-3 rounded-xl bg-slate-900 border border-slate-800/80 space-y-1">
-                  <span className="text-[10px] text-slate-400 uppercase tracking-wider block">Integrity Score</span>
-                  <span className="text-lg font-bold font-mono text-emerald-400">
-                    {finalReport.integrity_summary?.integrity_score ?? 100}/100
-                  </span>
-                </div>
-                <div className="p-3 rounded-xl bg-slate-900 border border-slate-800/80 space-y-1">
-                  <span className="text-[10px] text-slate-400 uppercase tracking-wider block">Face Present Rate</span>
-                  <span className="text-lg font-bold font-mono text-white">
-                    {finalReport.integrity_summary?.face_present_percentage ?? 100}%
-                  </span>
-                </div>
-                <div className="p-3 rounded-xl bg-slate-900 border border-slate-800/80 space-y-1">
-                  <span className="text-[10px] text-slate-400 uppercase tracking-wider block">Challenges Passed</span>
-                  <span className="text-lg font-bold font-mono text-indigo-300">
-                    {finalReport.integrity_summary?.challenges_passed ?? 1} /{' '}
-                    {(finalReport.integrity_summary?.challenges_passed ?? 1) +
-                      (finalReport.integrity_summary?.challenges_failed ?? 0)}
-                  </span>
-                </div>
-                <div className="p-3 rounded-xl bg-slate-900 border border-slate-800/80 space-y-1">
-                  <span className="text-[10px] text-slate-400 uppercase tracking-wider block">Pause / Loss Incidents</span>
-                  <span className="text-lg font-bold font-mono text-slate-300">
-                    {finalReport.integrity_summary?.pauses_count ?? 0} incidents
-                  </span>
-                </div>
-              </div>
-
-              <div className="text-[11px] text-slate-400 bg-slate-900/60 p-3 rounded-xl border border-slate-800/60 space-y-1">
-                <p className="text-indigo-300 font-medium">
-                  •{' '}
-                  {finalReport.integrity_summary?.non_verbal_excluded_note ||
-                    'Non-verbal scores (eye contact, posture) are computed only from verified-live segments; segments with active integrity flags were excluded.'}
-                  {' '}({finalReport.integrity_summary?.excluded_segments_count ?? 0} flagged segments excluded).
-                </p>
-                <p className="text-slate-400">
-                  • Active Camera Device:{' '}
-                  <span className="font-mono text-slate-200">
-                    {finalReport.integrity_summary?.camera_device_name || 'Physical Hardware Webcam Verified'}
-                  </span>
-                </p>
-              </div>
-
-              {/* Event Timeline Table */}
-              {finalReport.integrity_summary?.timeline_events &&
-              finalReport.integrity_summary.timeline_events.length > 0 ? (
-                <div className="space-y-2">
-                  <span className="text-xs font-semibold text-slate-300 block">Integrity Event Timeline</span>
-                  <div className="border border-slate-800 rounded-xl overflow-hidden text-xs">
-                    <div className="grid grid-cols-4 bg-slate-900 px-3 py-2 font-medium text-slate-400 border-b border-slate-800 text-[11px]">
-                      <span>Timestamp</span>
-                      <span>Flag</span>
-                      <span>Duration</span>
-                      <span>Confidence</span>
-                    </div>
-                    {finalReport.integrity_summary.timeline_events.slice(0, 5).map((evt, idx) => (
-                      <div
-                        key={idx}
-                        className="grid grid-cols-4 px-3 py-2 border-b border-slate-800/50 text-slate-300 font-mono text-[11px]"
-                      >
-                        <span>{evt.timestamp}s</span>
-                        <span className="text-amber-300">{evt.flag}</span>
-                        <span>{evt.duration_sec}s</span>
-                        <span>{Math.round(evt.confidence * 100)}%</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <div className="text-[11px] text-emerald-400/90 bg-emerald-950/20 border border-emerald-900/30 p-2.5 rounded-xl">
-                  ✓ Pristine session: Zero suspicious video, freeze, or virtual camera events flagged during the interview.
-                </div>
-              )}
-
-              {/* Heuristic Disclaimer */}
-              <p className="text-[10px] text-slate-500 italic text-center pt-1 border-t border-slate-800/50">
-                Disclaimer:{' '}
-                {finalReport.integrity_summary?.disclaimer ||
-                  'Integrity checks are automated heuristics and may produce false positives. Review flagged events before drawing conclusions.'}
-              </p>
-            </div>
-
-            <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-2">
-              <Button
-                onClick={handleDownloadPdf}
-                disabled={isGeneratingPdf}
-                variant="outline"
-                className="w-full sm:w-auto border-indigo-700/60 bg-indigo-950/30 hover:bg-indigo-900/40 text-indigo-300 font-semibold text-xs px-5 h-10 gap-2 cursor-pointer"
-              >
-                <Download className={`h-4 w-4 ${isGeneratingPdf ? 'animate-spin' : ''}`} />
-                {isGeneratingPdf ? 'Compiling Official PDF...' : 'Download Official PDF Report'}
-              </Button>
-
-              <Button
-                onClick={onExit}
-                className="w-full sm:w-auto bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs px-6 h-10 gap-2 cursor-pointer"
-              >
-                Return to Dashboard
-                <ArrowRight className="h-4 w-4" />
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
+  // Screen 3: Detailed Executive Scorecard Screen
+  if (roomPhase === 'scorecard' && finalReport) {
+    return (
+      <div className="min-h-screen w-full flex flex-col bg-background text-foreground">
+        <ExecutiveScorecard
+          session={session}
+          report={finalReport}
+          onBack={() => setRoomPhase('complete')}
+          onDownloadPdf={handleDownloadPdf}
+          isDownloadingPdf={isGeneratingPdf}
+          onReturnHome={onExit}
+        />
       </div>
     );
   }
 
   return (
-    <div className="w-full max-w-7xl mx-auto space-y-6">
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 p-4 rounded-2xl bg-slate-900/80 border border-slate-800 backdrop-blur-md">
-        <div className="flex items-center gap-3">
+    <div className="min-h-screen w-full flex flex-col bg-background text-foreground transition-colors selection:bg-primary/20">
+      {/* Wrap-up overlay while interviewer speaks closing line (§3.7) */}
+      {roomPhase === 'wrapping_up' && (
+        <div className="fixed inset-0 z-50 bg-background/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center space-y-4 animate-in fade-in duration-500">
+          <div className="h-16 w-16 rounded-full bg-primary/10 border border-primary/30 flex items-center justify-center text-primary">
+            <Sparkles className="h-8 w-8 animate-pulse text-primary" />
+          </div>
+          <h2 className="text-2xl font-bold text-foreground tracking-tight">Concluding Interview</h2>
+          <p className="text-sm text-muted-foreground max-w-md">
+            "That concludes our interview today. Thank you for your time and thoughtful responses."
+          </p>
+        </div>
+      )}
+
+      {/* Top Bar with product logo, timer, privacy indicator ("Camera & mic active: monitoring posture & eye contact"), theme toggle, and End button */}
+      <InterviewTopBar
+        role={session.role}
+        seniority={session.seniority}
+        remainingSeconds={remainingSeconds}
+        totalDurationMinutes={durationMinutes}
+        cameraActive={visionStatus === 'running'}
+        micActive={audioStream !== null}
+        onEndInterview={() => {
+          sendWSMessage({ type: 'end_interview', reason: 'user_ended' });
+          stopAll();
+          setAbortReason('user_ended');
+          setRoomPhase('aborted');
+        }}
+        onOpenHelp={() => setIsHelpDrawerOpen(true)}
+        showTimer={true}
+        interviewerName="AI Interviewer"
+      />
+
+      {/* Main Immersive Interview Stage */}
+      <main className="flex-1 w-full max-w-5xl mx-auto px-4 sm:px-6 py-6 flex flex-col items-center justify-center relative select-none">
+        {/* Error notification if any */}
+        {errorMessage && (
+          <div className="absolute top-4 left-4 right-4 max-w-lg mx-auto p-3 rounded-xl bg-destructive/15 border border-destructive/30 text-destructive text-xs text-center z-20">
+            {errorMessage}
+          </div>
+        )}
+
+        {/* Center Stage: Large Animated AI Interviewer Orb */}
+        <div className="w-full flex flex-col items-center justify-center space-y-8 my-auto">
+          <InterviewerOrb
+            state={orbState}
+            audioLevel={isAiSpeaking ? 0.7 : audioLevel}
+            isCandidateSpeaking={isCandidateSpeaking}
+            className="my-2"
+          />
+
+          {/* Question Caption revealed in sync with speech */}
+          <QuestionCaption
+            questionText={currentQuestion}
+            isAiSpeaking={isAiSpeaking}
+            className="mt-4"
+          />
+
+          {/* Subtle State Hint */}
+          <div className="flex flex-col items-center justify-center gap-2 pt-2">
+            <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-muted/40 border border-border/50 text-xs text-muted-foreground font-medium transition-all">
+              {noSpeechRemaining !== null && (
+                <div className="relative w-4 h-4 flex items-center justify-center">
+                  <div className="absolute inset-0 rounded-full border border-amber-400/40 animate-ping" />
+                  <div className="w-2 h-2 rounded-full bg-amber-400" />
+                </div>
+              )}
+              <span>{stateHint}</span>
+            </div>
+          </div>
+
+          {/* Dedicated Live Candidate Answer Transcript (§Q6) */}
+          {showCandidateCaptions && (
+            <CandidateAnswerTranscript
+              transcript={transcript}
+              interimTranscript={interimTranscript}
+              isListening={turnState === 'candidate_turn' || isListening}
+              isCandidateSpeaking={isCandidateSpeaking}
+              isAiSpeaking={isAiSpeaking}
+              isSubmitting={isSubmitting}
+              audioLevel={audioLevel}
+              silenceProgress={silenceProgress}
+              isSpeechSupported={isSpeechSupported}
+              sttError={sttError}
+              onSubmit={executeAnswerSubmission}
+              onClearAndRetry={clearTranscript}
+              onManualTextChange={setTranscript}
+              onRetryMic={handleRetryMic}
+              className="mt-4"
+            />
+          )}
+        </div>
+
+        {/* Developer HUD: ONLY rendered if ?debug=1 is present in URL */}
+        {isDebugMode && (
+          <div className="fixed top-16 right-4 z-50 w-80 p-3 rounded-2xl bg-card/95 border border-border shadow-2xl backdrop-blur-md text-xs space-y-2 animate-in fade-in">
+            <div className="flex items-center justify-between pb-1.5 border-b border-border font-mono">
+              <span className="font-bold text-foreground">DEBUG TELEMETRY HUD</span>
+              <span className="text-emerald-400">{ackedPacketCount} acked</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2 font-mono text-[11px]">
+              <div className="p-1.5 rounded bg-muted/40">
+                <span className="text-muted-foreground block">FPS</span>
+                <span className="font-bold text-foreground">{latestMetrics.fps}</span>
+              </div>
+              <div className="p-1.5 rounded bg-muted/40">
+                <span className="text-muted-foreground block">Eye Contact</span>
+                <span className="font-bold text-foreground">
+                  {latestMetrics.eyeContactRatio !== null
+                    ? `${Math.round(latestMetrics.eyeContactRatio * 100)}%`
+                    : '—'}
+                </span>
+              </div>
+              <div className="p-1.5 rounded bg-muted/40">
+                <span className="text-muted-foreground block">Posture</span>
+                <span className="font-bold text-foreground">
+                  {latestMetrics.postureScore !== null
+                    ? `${Math.round(latestMetrics.postureScore * 100)}%`
+                    : '—'}
+                </span>
+              </div>
+              <div className="p-1.5 rounded bg-muted/40">
+                <span className="text-muted-foreground block">Face Present</span>
+                <span className={`font-bold ${latestMetrics.facePresent ? 'text-emerald-400' : 'text-amber-400'}`}>
+                  {latestMetrics.facePresent ? 'True' : 'False'}
+                </span>
+              </div>
+            </div>
+            <MetricsHUD {...latestMetrics} />
+          </div>
+        )}
+      </main>
+
+      {/* Bottom Bar Controls */}
+      <footer className="w-full border-t border-border/80 bg-background/80 backdrop-blur-md px-4 sm:px-6 h-16 flex items-center justify-between relative z-30">
+        {/* Left: Self-View Toggle and Accessibility Captions Toggle */}
+        <div className="flex items-center gap-2">
           <Button
             variant="ghost"
             size="sm"
-            onClick={onExit}
-            className="text-slate-400 hover:text-white"
+            onClick={() => setShowSelfView((prev) => !prev)}
+            className={`h-9 px-3 text-xs font-medium gap-1.5 rounded-full border border-border/60 ${
+              showSelfView ? 'bg-primary/15 text-primary border-primary/40' : 'text-muted-foreground hover:text-foreground'
+            }`}
           >
-            <ChevronLeft className="h-4 w-4 mr-1" />
-            Exit Room
+            <Video className="h-4 w-4" />
+            <span>{showSelfView ? 'Hide Self-View' : 'Show Self-View'}</span>
           </Button>
-          <div className="h-4 w-[1px] bg-slate-800 hidden sm:block" />
-          <div>
-            <div className="flex items-center gap-2">
-              <h2 className="text-base font-bold text-white tracking-tight">
-                {session.seniority} {session.role}
-              </h2>
-              <Badge variant="outline" className="border-indigo-600/40 text-indigo-300 text-xs font-mono">
-                {currentDifficulty} Tier
-              </Badge>
-              {lastDifficultyChange && (
-                <Badge
-                  variant={lastDifficultyChange === 'UPGRADE' ? 'success' : 'outline'}
-                  className="gap-1 text-[10px] font-mono animate-bounce"
-                >
-                  {lastDifficultyChange === 'UPGRADE' ? (
-                    <TrendingUp className="h-3 w-3" />
-                  ) : (
-                    <TrendingDown className="h-3 w-3" />
-                  )}
-                  {lastDifficultyChange}
-                </Badge>
-              )}
-            </div>
-            <p className="text-xs text-slate-400 font-mono">Session ID: {session.id}</p>
-          </div>
+
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setShowCandidateCaptions((prev) => {
+                const next = !prev;
+                localStorage.setItem('SHOW_CANDIDATE_CAPTIONS', String(next));
+                return next;
+              });
+            }}
+            className={`h-9 px-3 text-xs font-medium gap-1.5 rounded-full border border-border/60 ${
+              showCandidateCaptions ? 'bg-primary/15 text-primary border-primary/40' : 'text-muted-foreground hover:text-foreground'
+            }`}
+            title="Toggle candidate real-time speech transcript"
+          >
+            <Subtitles className="h-4 w-4" />
+            <span className="hidden sm:inline">Transcript</span>
+          </Button>
         </div>
 
-        <div className="flex items-center gap-3 self-end sm:self-auto flex-wrap">
-          {import.meta.env.DEV && import.meta.env.VITE_ALLOW_MOCK_CAMERA === 'true' && (
-            <Badge variant="destructive" className="bg-rose-600 text-white font-bold py-1 px-2.5 text-xs animate-pulse">
-              DEV MOCK
-            </Badge>
-          )}
-
-          {/* Camera Integrity Status Dot & Subtle Text (§5.2) */}
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-950/80 border border-slate-800 text-xs font-mono">
-            {!integrityStatusInfo || integrityStatusInfo.status === 'error' || isCameraLostModalOpen ? (
-              <>
-                <span className="h-2 w-2 rounded-full bg-rose-500 animate-ping" />
-                <span className="text-rose-400 font-semibold">
-                  Camera integrity: Problem — {integrityStatusInfo?.error || 'Feed lost'}
-                </span>
-              </>
-            ) : integrityStatusInfo.activeFlags.length > 0 ? (
-              <>
-                <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
-                <span className="text-amber-300">
-                  Camera integrity: Warning — {integrityStatusInfo.activeFlags[0].flag.replace(/_/g, ' ')} suspected
-                </span>
-              </>
-            ) : integrityStatusInfo.isPhysicalVerified ? (
-              <>
-                <span className="h-2 w-2 rounded-full bg-emerald-500" />
-                <span className="text-emerald-400">Camera integrity: Good</span>
-              </>
-            ) : (
-              <>
-                <span className="h-2 w-2 rounded-full bg-slate-500" />
-                <span className="text-slate-400">Camera integrity: Initializing...</span>
-              </>
-            )}
-          </div>
-
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-950/80 border border-slate-800 text-xs font-mono">
-            {wsStatus === 'connected' ? (
-              <>
-                <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
-                <span className="text-emerald-400">WS Telemetry Active</span>
-                <span className="text-slate-500">({packetCount})</span>
-              </>
-            ) : wsStatus === 'connecting' || wsStatus === 'reconnecting' ? (
-              <>
-                <span className="h-2 w-2 rounded-full bg-amber-500 animate-ping" />
-                <span className="text-amber-400">{wsStatus === 'reconnecting' ? 'Reconnecting WS...' : 'Connecting WS...'}</span>
-              </>
-            ) : (
-              <>
-                <span className="h-2 w-2 rounded-full bg-rose-500" />
-                <span className="text-rose-400">WS Disconnected</span>
-              </>
-            )}
-          </div>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        <div className="lg:col-span-5 space-y-4">
-          <WebcamMonitor
-            onTelemetryPacket={handleTelemetryPacket}
-            showHUD={true}
-            onIntegrityStatusChange={handleIntegrityStatusChange}
-            actionRef={webcamActionRef}
-          />
-        </div>
-
-        <div className="lg:col-span-7 space-y-4">
-          <Card className="border-indigo-900/60 bg-slate-900/90 shadow-xl backdrop-blur-md">
-            <CardHeader className="pb-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Target className="h-5 w-5 text-indigo-400" />
-                  <CardTitle className="text-base text-white">
-                    Question {questionIndex} of {maxQuestions}
-                  </CardTitle>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Badge variant="outline" className="border-indigo-600/60 text-indigo-300 font-mono text-xs">
-                    Difficulty: {currentDifficulty}
-                  </Badge>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={handleToggleSpeech}
-                    className={`h-7 px-2 text-xs gap-1 ${
-                      isSpeakingQuestion
-                        ? 'border-indigo-500 bg-indigo-600/20 text-indigo-300'
-                        : 'border-slate-800 bg-slate-950 text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    {isSpeakingQuestion ? (
-                      <>
-                        <Square className="h-3 w-3 fill-indigo-400" />
-                        Stop Audio
-                      </>
-                    ) : (
-                      <>
-                        <Play className="h-3 w-3 fill-slate-400" />
-                        Play Audio (TTS)
-                      </>
-                    )}
-                  </Button>
-                </div>
-              </div>
-            </CardHeader>
-
-            <CardContent className="space-y-4">
-              {isInitializing ? (
-                <div className="py-8 flex flex-col items-center justify-center gap-2 text-slate-400 text-xs font-mono">
-                  <RefreshCw className="h-5 w-5 animate-spin text-indigo-400" />
-                  <span>Synthesizing tailored question via LangGraph...</span>
-                </div>
-              ) : (
-                <div className="p-4 rounded-xl bg-slate-950/80 border border-slate-800 text-sm text-white font-medium leading-relaxed">
-                  {currentQuestion}
-                </div>
-              )}
-
-              {lastEvaluation && (
-                <div className="p-3.5 rounded-xl bg-indigo-950/40 border border-indigo-800/60 text-xs space-y-2 animate-in fade-in">
-                  <div className="flex items-center justify-between">
-                    <span className="font-semibold text-indigo-200 flex items-center gap-1.5">
-                      <Sparkles className="h-3.5 w-3.5 text-indigo-400" />
-                      Answer Score: {lastEvaluation.score}/10
-                    </span>
-                    <div className="flex gap-2 font-mono text-[11px] text-slate-400">
-                      <span>Tech: {lastEvaluation.technical_accuracy}</span>
-                      <span>Clarity: {lastEvaluation.clarity}</span>
-                      <span>Completeness: {lastEvaluation.completeness}</span>
-                    </div>
-                  </div>
-                  <p className="text-slate-300 italic">"{lastEvaluation.feedback}"</p>
-                  {lastEvaluation.encouragement && (
-                    <p className="text-emerald-300 text-[11px] font-medium">
-                      💡 {lastEvaluation.encouragement}
-                    </p>
-                  )}
-                </div>
-              )}
-
-              {errorMessage && (
-                <div className="p-3 rounded-lg bg-rose-950/60 border border-rose-800 text-rose-200 text-xs">
-                  {errorMessage}
-                </div>
-              )}
-
-              <div className="space-y-2 pt-2">
-                <div className="flex items-center justify-between text-xs">
-                  <label className="font-semibold text-slate-300 flex items-center gap-2">
-                    <span>Your Technical Response</span>
-                    {isRecordingAnswer && (
-                      <span className="inline-flex items-center gap-1 text-rose-400 font-mono text-[11px] animate-pulse">
-                        <span className="h-2 w-2 rounded-full bg-rose-500" />
-                        Listening...
-                      </span>
-                    )}
-                  </label>
-
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={handleToggleDictation}
-                      className={`text-xs px-2.5 py-1 rounded-md border flex items-center gap-1.5 transition-colors ${
-                        isRecordingAnswer
-                          ? 'border-rose-500 bg-rose-950/60 text-rose-300'
-                          : 'border-slate-800 bg-slate-950 text-slate-400 hover:text-white hover:border-slate-700'
-                      }`}
-                    >
-                      {isRecordingAnswer ? <MicOff className="h-3 w-3" /> : <Mic className="h-3 w-3" />}
-                      {isRecordingAnswer ? 'Stop Dictation' : 'Speech-to-Text (STT)'}
-                    </button>
-
-                  </div>
-                </div>
-
-                <textarea
-                  rows={4}
-                  value={candidateAnswer}
-                  onChange={(e) => setCandidateAnswer(e.target.value)}
-                  placeholder="Explain your approach, design decisions, trade-offs, and failure handling (type or speak)..."
-                  className="w-full p-3.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none font-sans"
+        {/* Center: Quiet Mic Level Indicator & Pause Button */}
+        <div className="flex items-center gap-3">
+          {/* Subtle Mic Activity Glow */}
+          <div
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-full border transition-all duration-200 select-none ${
+              isCandidateSpeaking
+                ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400 shadow-[0_0_12px_rgba(16,185,129,0.25)]'
+                : 'bg-muted/40 border-border/60 text-muted-foreground'
+            }`}
+            title={isCandidateSpeaking ? 'Speaking: Mic detecting voice' : 'Mic listening'}
+          >
+            <Mic className="h-3.5 w-3.5" />
+            <div className="flex items-center gap-0.5 h-3">
+              {[0.15, 0.4, 0.7].map((threshold, i) => (
+                <div
+                  key={i}
+                  className={`w-0.5 rounded-full transition-all duration-75 ${
+                    audioLevel >= threshold
+                      ? 'bg-emerald-400 h-3'
+                      : audioLevel >= threshold * 0.5
+                      ? 'bg-primary h-2'
+                      : 'bg-muted-foreground/30 h-1'
+                  }`}
                 />
+              ))}
+            </div>
+          </div>
 
-                <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1 font-mono">
-                  <div className="flex items-center gap-1.5">
-                    <Volume2 className="h-3.5 w-3.5 text-indigo-400" />
-                    <span>Live Audio Energy:</span>
-                    <div className="flex items-end gap-0.5 h-3">
-                      {[3, 6, 12, 18, 10, 14, 8].map((h, i) => (
-                        <div
-                          key={i}
-                          className="w-1 bg-indigo-500 rounded-sm"
-                          style={{
-                            height: `${isRecordingAnswer ? h : 2}px`,
-                            opacity: isRecordingAnswer ? 1 : 0.3,
-                          }}
-                        />
-                      ))}
+          {/* Pause / Resume Button */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setIsUserPaused((prev) => !prev)}
+            className="h-9 px-3.5 text-xs font-medium gap-1.5 rounded-full border-border/80 hover:bg-muted/60"
+            title="Pause or resume the interview session (Spacebar)"
+          >
+            {isUserPaused ? (
+              <>
+                <Play className="h-3.5 w-3.5 fill-current" />
+                <span>Resume</span>
+              </>
+            ) : (
+              <>
+                <Pause className="h-3.5 w-3.5" />
+                <span>Pause</span>
+              </>
+            )}
+          </Button>
+        </div>
+
+        {/* Right: Having trouble? Help Button */}
+        <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              if (onOpenHelp) {
+                onOpenHelp();
+              }
+              setIsHelpDrawerOpen(true);
+            }}
+            className="h-9 px-3 text-xs font-medium gap-1.5 text-muted-foreground hover:text-foreground rounded-full border border-border/60 hover:bg-muted/60"
+          >
+            <HelpCircle className="h-4 w-4" />
+            <span className="hidden sm:inline">Having trouble?</span>
+          </Button>
+        </div>
+      </footer>
+
+      {/* Floating Picture-in-Picture Self-View Thumbnail */}
+      {showSelfView && (
+        <div className="fixed bottom-20 left-6 z-40 w-56 sm:w-64 rounded-2xl bg-card/95 border border-border shadow-2xl p-2.5 backdrop-blur-md animate-in fade-in slide-in-from-bottom-4">
+          <div className="flex items-center justify-between pb-1.5 mb-1.5 border-b border-border">
+            <div className="flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" />
+              <span className="text-xs font-semibold text-foreground">Self-View</span>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowSelfView(false)}
+              className="h-5 w-5 p-0 text-muted-foreground hover:text-foreground"
+              title="Hide Self-View"
+            >
+              <X className="h-3 w-3" />
+            </Button>
+          </div>
+          <div className="relative aspect-video w-full rounded-xl bg-muted overflow-hidden border border-border">
+            <video
+              ref={selfViewVideoRef}
+              playsInline
+              muted
+              autoPlay
+              className="w-full h-full object-cover transform -scale-x-100"
+            />
+          </div>
+          <p className="text-[10px] text-muted-foreground mt-1.5 text-center">
+            On-device local processing • Not recorded
+          </p>
+        </div>
+      )}
+
+      {/* Background processing video (always rendered, visually hidden 2x2px, non-display:none so browser continues delivering frames) (§2.2 Invariant 1 & 2) */}
+      <video
+        ref={backgroundVideoRef}
+        playsInline
+        muted
+        autoPlay
+        style={{
+          width: '2px',
+          height: '2px',
+          opacity: 0.01,
+          position: 'fixed',
+          bottom: 0,
+          right: 0,
+          pointerEvents: 'none',
+        }}
+        aria-hidden="true"
+      />
+      <canvas
+        ref={backgroundCanvasRef}
+        style={{
+          width: '2px',
+          height: '2px',
+          opacity: 0.01,
+          position: 'fixed',
+          bottom: 0,
+          right: 0,
+          pointerEvents: 'none',
+        }}
+        aria-hidden="true"
+      />
+
+      {/* Active Liveness Challenge Modal Overlay (§4.2, §5) */}
+      {(activeChallengeStep || challengeNotification) && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="challenge-dialog-title"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-background/80 backdrop-blur-md animate-in fade-in"
+        >
+          <div className="relative w-full max-w-lg rounded-2xl bg-card border border-primary/40 shadow-2xl overflow-hidden p-6 space-y-5">
+            <div className="flex items-center justify-between pb-3 border-b border-border">
+              <div className="flex items-center gap-2.5">
+                <div className="h-9 w-9 rounded-xl bg-primary/15 border border-primary/30 flex items-center justify-center text-primary">
+                  <ShieldCheck className="h-5 w-5 animate-pulse" />
+                </div>
+                <div>
+                  <h3 id="challenge-dialog-title" className="text-base font-semibold text-foreground">
+                    Physical Presence Check
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    Brief gesture verification to confirm active physical presence
+                  </p>
+                </div>
+              </div>
+              <Badge variant="outline" className="font-mono text-xs px-2 py-0.5">
+                {challengeNotification
+                  ? challengeNotification.type === 'success'
+                    ? 'Verified'
+                    : 'Failed'
+                  : `${challengeRemainingSec.toFixed(1)}s`}
+              </Badge>
+            </div>
+
+            {challengeNotification ? (
+              <div
+                className={`p-4 rounded-xl border flex items-center gap-3 ${
+                  challengeNotification.type === 'success'
+                    ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-300'
+                    : 'bg-rose-950/40 border-rose-500/50 text-rose-300'
+                }`}
+              >
+                {challengeNotification.type === 'success' ? (
+                  <CheckCircle2 className="h-6 w-6 shrink-0 text-emerald-400" />
+                ) : (
+                  <AlertCircle className="h-6 w-6 shrink-0 text-rose-400" />
+                )}
+                <div>
+                  <div className="font-semibold text-sm">
+                    {challengeNotification.type === 'success'
+                      ? 'Verification Passed'
+                      : 'Challenge Unsuccessful'}
+                  </div>
+                  <div className="text-xs opacity-90">{challengeNotification.message}</div>
+                </div>
+              </div>
+            ) : (
+              activeChallengeStep && (
+                <>
+                  <div className="p-4 rounded-xl bg-primary/10 border border-primary/20 text-center space-y-2">
+                    <div className="flex items-center justify-center gap-2 text-primary font-semibold text-base sm:text-lg">
+                      {renderChallengeIcon(activeChallengeStep.action)}
+                      <span>{activeChallengeStep.prompt}</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Please perform this natural head or facial gesture towards your webcam.
+                    </p>
+                  </div>
+
+                  <div className="relative aspect-video w-full rounded-xl bg-muted overflow-hidden border border-border shadow-inner">
+                    <video
+                      ref={challengeVideoRef}
+                      playsInline
+                      muted
+                      autoPlay
+                      className="w-full h-full object-cover transform -scale-x-100"
+                    />
+
+                    <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between bg-card/85 backdrop-blur-sm px-3 py-1.5 rounded-lg border border-border text-xs">
+                      <span className="text-muted-foreground font-medium">Gesture Detected</span>
+                      <span className="font-mono font-bold text-primary">
+                        {Math.round(challengeScore * 100)}%
+                      </span>
                     </div>
                   </div>
 
-                  <Button
-                    onClick={handleSubmitAnswer}
-                    disabled={isSubmitting || isPausedByIntegrity || !candidateAnswer.trim()}
-                    className="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs px-6 h-9 gap-2 cursor-pointer shadow-lg shadow-indigo-600/20 disabled:opacity-50"
-                  >
-                    {isSubmitting ? (
-                      <span className="flex items-center gap-2">
-                        <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                        Evaluating via Rubric...
-                      </span>
-                    ) : isPausedByIntegrity ? (
-                      <span className="flex items-center gap-2 text-rose-300">
-                        <ShieldAlert className="h-3.5 w-3.5 text-rose-400" />
-                        Interview Paused (Camera Lost)
-                      </span>
-                    ) : (
-                      <>
-                        <Send className="h-3.5 w-3.5" />
-                        Submit Answer & Proceed
-                      </>
-                    )}
-                  </Button>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
+                  <div className="space-y-3 pt-1">
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs text-muted-foreground">
+                        <span>Movement Recognition</span>
+                        <span>{Math.round(challengeScore * 100)}% / 100%</span>
+                      </div>
+                      <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-primary to-indigo-500 transition-all duration-100 ease-out"
+                          style={{ width: `${Math.min(100, Math.round(challengeScore * 100))}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
-      {/* Accessible Camera Lost Modal with 30s Grace Countdown (§5.2) */}
+      {/* 30-Second Recovery Grace Modal (§5.3) */}
       <CameraLostModal
         isOpen={isCameraLostModalOpen}
         graceSeconds={cameraLostGraceSec}
         reason={cameraLostReason}
+        availableCameras={availableCameras}
+        selectedDeviceId={selectedDeviceId}
+        onSelectCamera={selectCamera}
         onRestore={handleRestoreCamera}
         onGraceExpired={handleGraceExpired}
       />
+
+      {/* Face Absence Recovery Modal with Warning Tiers (§3.5) */}
+      <FaceLostModal
+        isOpen={isFaceLostModalOpen}
+        missingSeconds={faceMissingSeconds}
+        videoStream={videoStream}
+        onFaceRestored={() => setIsFaceLostModalOpen(false)}
+      />
+
+      {/* Right-Side Slide-Over Help & Troubleshooting Drawer (§3.4) */}
+      <HelpDrawer
+        isOpen={isHelpDrawerOpen}
+        onClose={() => setIsHelpDrawerOpen(false)}
+        videoStream={videoStream}
+        audioStream={audioStream}
+        audioLevel={audioLevel}
+        availableCameras={availableCameras}
+        selectedCameraId={selectedDeviceId}
+        onSelectCamera={selectCamera}
+        onRetryCamera={handleRetryCamera}
+        onRetryMic={handleRetryMic}
+        onRepeatQuestion={handleRepeatQuestion}
+        hasRepeatedQuestion={hasRepeatedCurrentQuestion}
+        onReconnectWS={() => sendWSMessage({ type: 'ping' })}
+        wsStatus={_wsStatus}
+        sendWSMessage={sendWSMessage}
+        supportEmail={import.meta.env.VITE_SUPPORT_EMAIL || 'support@ai-interviewer.com'}
+      />
     </div>
   );
+}
+
+function renderChallengeIcon(action: string) {
+  switch (action) {
+    case 'turn_head_left':
+      return <ArrowLeft className="h-5 w-5 text-primary shrink-0" />;
+    case 'turn_head_right':
+      return <ArrowRight className="h-5 w-5 text-primary shrink-0" />;
+    case 'look_up':
+      return <ArrowUp className="h-5 w-5 text-primary shrink-0" />;
+    case 'nod':
+      return <ArrowDown className="h-5 w-5 text-primary shrink-0" />;
+    case 'smile':
+      return <Smile className="h-5 w-5 text-primary shrink-0" />;
+    case 'blink_twice':
+      return <Eye className="h-5 w-5 text-primary shrink-0" />;
+    default:
+      return <Sparkles className="h-5 w-5 text-primary shrink-0" />;
+  }
 }

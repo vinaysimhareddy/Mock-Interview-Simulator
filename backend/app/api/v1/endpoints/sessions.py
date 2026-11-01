@@ -48,6 +48,7 @@ async def create_session(
         difficulty=session_in.difficulty or "Adaptive",
         integrity_mode=session_in.integrity_mode or "strict",
         resume_id=session_in.resume_id,
+        max_questions=session_in.max_questions,
     )
 
     return SessionResponse(**session_doc)

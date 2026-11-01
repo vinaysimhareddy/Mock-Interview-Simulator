@@ -20,7 +20,9 @@ import { apiClient, ApiError } from '@/lib/api';
 import { ErrorBoundary } from '@/components/common/ErrorBoundary';
 import { ResumeUploadDropzone, ResumeData } from '@/components/interview/ResumeUploadDropzone';
 import { InterviewConfigurator, SessionData } from '@/components/interview/InterviewConfigurator';
+import { InterviewWelcome } from '@/components/interview/InterviewWelcome';
 import { PreInterviewSetup } from '@/components/interview/PreInterviewSetup';
+import { InterviewReady } from '@/components/interview/InterviewReady';
 import { InterviewRoom } from '@/components/interview/InterviewRoom';
 import { useMediaStream } from '@/context/CameraStreamContext';
 
@@ -29,8 +31,15 @@ export default function DashboardPage(): React.ReactElement {
   const { stopAll } = useMediaStream();
   const [selectedResume, setSelectedResume] = useState<ResumeData | null>(null);
   const [activeSession, setActiveSession] = useState<SessionData | null>(null);
+  const [welcomeSession, setWelcomeSession] = useState<SessionData | null>(null);
   const [setupSession, setSetupSession] = useState<SessionData | null>(null);
-  const [_sessionDurationMinutes, setSessionDurationMinutes] = useState<number>(20);
+  const [readySession, setReadySession] = useState<{
+    session: SessionData;
+    durationMinutes: number;
+    videoStream: MediaStream | null;
+    audioStream: MediaStream | null;
+  } | null>(null);
+  const [sessionDurationMinutes, setSessionDurationMinutes] = useState<number>(15);
   const [activeRoomSession, setActiveRoomSession] = useState<SessionData | null>(null);
   const [sessionsList, setSessionsList] = useState<SessionData[]>([]);
   const [resumesList, setResumesList] = useState<ResumeData[]>([]);
@@ -75,7 +84,7 @@ export default function DashboardPage(): React.ReactElement {
 
   const handleSessionCreated = (session: SessionData) => {
     setActiveSession(session);
-    setSetupSession(session);
+    setWelcomeSession(session);
     setSessionsList((prev) => [session, ...prev]);
   };
 
@@ -141,7 +150,23 @@ export default function DashboardPage(): React.ReactElement {
     }
   };
 
-  // If in pre-interview equipment & duration setup, render PreInterviewSetup
+  // Step 1: Interview Welcome (instructions + consent)
+  if (welcomeSession) {
+    return (
+      <InterviewWelcome
+        role={welcomeSession.role}
+        seniority={welcomeSession.seniority}
+        durationMinutes={sessionDurationMinutes}
+        onContinue={() => {
+          setSetupSession(welcomeSession);
+          setWelcomeSession(null);
+        }}
+        onBack={() => setWelcomeSession(null)}
+      />
+    );
+  }
+
+  // Step 2: Device & Camera Check (existing verified setup, restyled)
   if (setupSession) {
     return (
       <PreInterviewSetup
@@ -149,7 +174,12 @@ export default function DashboardPage(): React.ReactElement {
         seniority={setupSession.seniority}
         onStartInterview={(config) => {
           setSessionDurationMinutes(config.durationMinutes);
-          setActiveRoomSession(setupSession);
+          setReadySession({
+            session: setupSession,
+            durationMinutes: config.durationMinutes,
+            videoStream: config.videoStream,
+            audioStream: config.audioStream,
+          });
           setSetupSession(null);
         }}
         onCancel={() => setSetupSession(null)}
@@ -157,13 +187,31 @@ export default function DashboardPage(): React.ReactElement {
     );
   }
 
-  // If in live interview room, render the InterviewRoom component
+  // Step 3: Pre-start "Ready?" screen (duration shown, Start button = audio unlock gesture)
+  if (readySession) {
+    return (
+      <InterviewReady
+        session={readySession.session}
+        durationMinutes={readySession.durationMinutes}
+        onStart={() => {
+          setActiveRoomSession(readySession.session);
+          setReadySession(null);
+        }}
+        onBack={() => {
+          setSetupSession(readySession.session);
+          setReadySession(null);
+        }}
+      />
+    );
+  }
+
+  // Step 4: LIVE INTERVIEW STAGE
   if (activeRoomSession) {
     return (
       <InterviewRoom
         session={activeRoomSession}
         token={token || ''}
-        durationMinutes={_sessionDurationMinutes}
+        durationMinutes={sessionDurationMinutes}
         onExit={() => {
           stopAll();
           setActiveRoomSession(null);
@@ -291,7 +339,7 @@ export default function DashboardPage(): React.ReactElement {
                 </Badge>
                 <Button
                   size="sm"
-                  onClick={() => setSetupSession(activeSession)}
+                  onClick={() => setWelcomeSession(activeSession)}
                   className="h-8 bg-indigo-600 hover:bg-indigo-700 text-white text-xs gap-1.5 cursor-pointer"
                 >
                   <Video className="h-3.5 w-3.5" />
@@ -346,7 +394,7 @@ export default function DashboardPage(): React.ReactElement {
                     <Button
                       size="sm"
                       variant="outline"
-                      onClick={() => setSetupSession(sess)}
+                      onClick={() => setWelcomeSession(sess)}
                       className="h-7 px-2.5 text-xs text-indigo-300 border-indigo-800 hover:bg-indigo-950/60 gap-1 cursor-pointer"
                     >
                       <Video className="h-3 w-3" />

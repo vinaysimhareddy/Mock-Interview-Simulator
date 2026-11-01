@@ -7,9 +7,11 @@ from app.core.config import get_settings
 from app.core.security import get_current_user
 from app.models.resume import ResumeResponse, ResumeUpdate
 from app.models.user import UserInDB
+from app.repositories.resume_chunk_repo import resume_chunk_repo
 from app.repositories.resume_repo import resume_repo
 from app.services.ai_engine import AIServiceError, parse_resume_profile
 from app.services.pdf_parser import PDFExtractionError, extract_text
+from app.services.resume_ingestion_service import ingest_resume_chunks
 
 router = APIRouter(prefix="/resumes", tags=["resumes"])
 settings = get_settings()
@@ -104,6 +106,21 @@ async def upload_resume(
         parsed_profile=profile_dict,
     )
 
+    # 7. Ingest vector chunks into resume_chunks collection with embeddings (§2.3, Q2)
+    try:
+        await ingest_resume_chunks(
+            resume_id=resume_doc["id"],
+            user_id=current_user.id,
+            raw_text=raw_text,
+            parsed_profile=profile_dict,
+        )
+    except Exception as chunk_exc:
+        logger.warning(
+            "Resume vector chunking failed for %s: %s. Raw resume is preserved.",
+            resume_doc["id"],
+            chunk_exc,
+        )
+
     return ResumeResponse(
         id=resume_doc["id"],
         user_id=current_user.id,
@@ -173,4 +190,34 @@ async def update_resume(
     updated = await resume_repo.update_profile(resume_id, current_user.id, profile)
     if not updated:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume not found.")
+
+    # Re-ingest chunks upon resume update
+    try:
+        await ingest_resume_chunks(
+            resume_id=resume_id,
+            user_id=current_user.id,
+            raw_text=doc.get("raw_text", ""),
+            parsed_profile=profile,
+        )
+    except Exception as chunk_exc:
+        logger.warning("Resume re-chunking failed for %s: %s", resume_id, chunk_exc)
+
     return ResumeResponse(**updated)
+
+
+@router.delete(
+    "/{resume_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a resume and all its vector chunks",
+)
+async def delete_resume(
+    resume_id: str,
+    current_user: Annotated[UserInDB, Depends(get_current_user)],
+) -> None:
+    """Delete candidate resume and all associated chunks with user ownership enforcement."""
+    deleted = await resume_repo.delete_by_id_and_user(resume_id, current_user.id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume not found.")
+
+    # Clean up associated vector chunks
+    await resume_chunk_repo.delete_by_resume_and_user(resume_id=resume_id, user_id=current_user.id)

@@ -24,6 +24,7 @@ import {
   TelemetrySample,
 } from '../lib/types';
 import {
+  ChallengeActionType,
   IntegrityFlagEvent,
   LivenessChallengeStep,
 } from '../lib/integrityTypes';
@@ -54,6 +55,13 @@ export interface UseMediaPipeVisionOptions {
   selectedDeviceId?: string;
   onIntegrityEvent?: (event: CameraIntegrityEvent) => void;
   onAntiSpoofFlag?: (event: IntegrityFlagEvent) => void;
+  onChallengeComplete?: (result: {
+    challengeId: string;
+    nonce: string;
+    passed: boolean;
+    score: number;
+    action: ChallengeActionType;
+  }) => void;
 }
 
 export interface UseMediaPipeVisionReturn {
@@ -67,13 +75,17 @@ export interface UseMediaPipeVisionReturn {
   calibrationProgress: number; // 0..100
   availableCameras: MediaDeviceInfo[];
   activeCameraLabel: string;
+  selectedDeviceId: string;
   isPhysicalVerified: boolean;
   activeIntegrityFlags: IntegrityFlagEvent[];
   activeChallenge: LivenessChallengeStep | null;
   challengeStatus: 'idle' | 'in_progress' | 'passed' | 'failed';
+  challengeScore: number;
   startCalibration: () => void;
   selectCamera: (deviceId: string) => Promise<void>;
-  startChallenge: (count?: number) => void;
+  startChallenge: (
+    stepsOrCount?: number | LivenessChallengeStep | LivenessChallengeStep[]
+  ) => void;
   resetChallenge: () => void;
   start: () => Promise<void>;
   stop: () => void;
@@ -90,6 +102,7 @@ export function useMediaPipeVision(
     selectedDeviceId: initialDeviceId,
     onIntegrityEvent,
     onAntiSpoofFlag,
+    onChallengeComplete,
   } = options;
 
   const [status, setStatus] = useState<VisionStatus>('idle');
@@ -106,6 +119,9 @@ export function useMediaPipeVision(
   const antiSpoofDetectorRef = useRef<PassiveAntiSpoofDetector>(new PassiveAntiSpoofDetector());
   const challengeEvaluatorRef = useRef<ChallengeGestureEvaluator>(new ChallengeGestureEvaluator());
   const downsamplerCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const downsamplerCtxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const downsampledBufferRef = useRef<Uint8ClampedArray>(new Uint8ClampedArray(64 * 36));
+  const lastAntiSpoofTimeRef = useRef<number>(0);
 
   const animationFrameIdRef = useRef<number | null>(null);
   const rvfcHandleRef = useRef<number | null>(null);
@@ -136,7 +152,26 @@ export function useMediaPipeVision(
   const [challengeStatus, setChallengeStatus] = useState<
     'idle' | 'in_progress' | 'passed' | 'failed'
   >('idle');
+  const [challengeScore, setChallengeScore] = useState<number>(0);
   const challengeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const challengeListRef = useRef<LivenessChallengeStep[]>([]);
+  const challengeStatusRef = useRef<'idle' | 'in_progress' | 'passed' | 'failed'>('idle');
+  const currentStepIndexRef = useRef<number>(0);
+  const activeIntegrityFlagsRef = useRef<IntegrityFlagEvent[]>([]);
+
+  useEffect(() => {
+    challengeListRef.current = challengeList;
+  }, [challengeList]);
+  useEffect(() => {
+    challengeStatusRef.current = challengeStatus;
+  }, [challengeStatus]);
+  useEffect(() => {
+    currentStepIndexRef.current = currentStepIndex;
+  }, [currentStepIndex]);
+  useEffect(() => {
+    activeIntegrityFlagsRef.current = activeIntegrityFlags;
+  }, [activeIntegrityFlags]);
 
   // Calibration state
   const [isCalibrating, setIsCalibrating] = useState<boolean>(false);
@@ -183,6 +218,11 @@ export function useMediaPipeVision(
   useEffect(() => {
     onAntiSpoofFlagRef.current = onAntiSpoofFlag;
   }, [onAntiSpoofFlag]);
+
+  const onChallengeCompleteRef = useRef(onChallengeComplete);
+  useEffect(() => {
+    onChallengeCompleteRef.current = onChallengeComplete;
+  }, [onChallengeComplete]);
 
   /**
    * Enumerate available physical cameras (post-permission).
@@ -275,28 +315,51 @@ export function useMediaPipeVision(
   }, []);
 
   /**
-   * Start an active liveness challenge sequence (§4.2).
+   * Start an active liveness challenge sequence or single server step (§4.2).
    */
-  const startChallenge = useCallback((count: number = 3) => {
-    const sequence = generateChallengeSequence(count);
-    setChallengeList(sequence);
-    setCurrentStepIndex(0);
-    setChallengeStatus('in_progress');
-    challengeEvaluatorRef.current.reset();
+  const startChallenge = useCallback(
+    (stepsOrCount: number | LivenessChallengeStep | LivenessChallengeStep[] = 3) => {
+      let sequence: LivenessChallengeStep[];
+      if (typeof stepsOrCount === 'number') {
+        sequence = generateChallengeSequence(stepsOrCount);
+      } else if (Array.isArray(stepsOrCount)) {
+        sequence = stepsOrCount;
+      } else {
+        sequence = [stepsOrCount];
+      }
 
-    if (challengeTimerRef.current) clearTimeout(challengeTimerRef.current);
-    if (sequence.length > 0) {
-      challengeTimerRef.current = setTimeout(() => {
-        setChallengeStatus('failed');
-      }, sequence[0].timeoutMs);
-    }
-  }, []);
+      setChallengeList(sequence);
+      setCurrentStepIndex(0);
+      setChallengeStatus('in_progress');
+      setChallengeScore(0);
+      challengeEvaluatorRef.current.reset();
+
+      if (challengeTimerRef.current) clearTimeout(challengeTimerRef.current);
+      if (sequence.length > 0) {
+        challengeTimerRef.current = setTimeout(() => {
+          setChallengeStatus('failed');
+          const failedStep = sequence[currentStepIndexRef.current] || sequence[0];
+          if (onChallengeCompleteRef.current && failedStep) {
+            onChallengeCompleteRef.current({
+              challengeId: failedStep.id,
+              nonce: failedStep.nonce,
+              passed: false,
+              score: 0,
+              action: failedStep.action,
+            });
+          }
+        }, sequence[0].timeoutMs);
+      }
+    },
+    []
+  );
 
   const resetChallenge = useCallback(() => {
     if (challengeTimerRef.current) clearTimeout(challengeTimerRef.current);
     setChallengeStatus('idle');
     setChallengeList([]);
     setCurrentStepIndex(0);
+    setChallengeScore(0);
     challengeEvaluatorRef.current.reset();
   }, []);
 
@@ -382,7 +445,7 @@ export function useMediaPipeVision(
               video: {
                 width: { ideal: 1280 },
                 height: { ideal: 720 },
-                frameRate: { ideal: 30, min: 15 },
+                frameRate: { ideal: 30 },
                 facingMode: 'user',
                 ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
               },
@@ -531,7 +594,11 @@ export function useMediaPipeVision(
                 }
               }
 
-              lookingAtCamera = isLookingAtCamera(blendshapeDict, headPose);
+              lookingAtCamera = isLookingAtCamera(
+                blendshapeDict,
+                headPose,
+                aggregatorRef.current.getBaseline()
+              );
 
               expression = {
                 smile: blendshapeDict['mouthSmileLeft'] || blendshapeDict['mouthSmileRight'] || 0,
@@ -542,76 +609,105 @@ export function useMediaPipeVision(
               calibrationLandmarksRef.current = rawLandmarks as Landmark3D[];
             }
 
-            // Downsample frame to 64x36 for passive anti-spoof analysis (§4.1)
+            // Downsample frame for passive anti-spoof analysis throttled to ~2 Hz (every 500ms)
+            // Reuses pre-allocated buffer without per-frame allocations to preserve ~30 FPS vision loop
             let downsampledPixels: Uint8ClampedArray | undefined;
             let meanLum: number | undefined;
 
-            if (downsamplerCanvasRef.current && video.videoWidth > 0 && video.videoHeight > 0) {
-              const dCtx = downsamplerCanvasRef.current.getContext('2d', { willReadFrequently: true });
-              if (dCtx) {
-                dCtx.drawImage(video, 0, 0, 64, 36);
-                const imgData = dCtx.getImageData(0, 0, 64, 36);
-                const dArray = new Uint8ClampedArray(64 * 36);
-                let lumSum = 0;
-                for (let i = 0; i < 64 * 36; i++) {
-                  const r = imgData.data[i * 4];
-                  const g = imgData.data[i * 4 + 1];
-                  const b = imgData.data[i * 4 + 2];
-                  const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-                  dArray[i] = lum;
-                  lumSum += lum;
+            const shouldRunAntiSpoof = now - lastAntiSpoofTimeRef.current >= 500;
+            if (shouldRunAntiSpoof) {
+              lastAntiSpoofTimeRef.current = now;
+              if (downsamplerCanvasRef.current && video.videoWidth > 0 && video.videoHeight > 0) {
+                if (!downsamplerCtxRef.current) {
+                  downsamplerCtxRef.current = downsamplerCanvasRef.current.getContext('2d', { willReadFrequently: true });
                 }
-                downsampledPixels = dArray;
-                meanLum = lumSum / (64 * 36);
-              }
-            }
-
-            // Run Passive Anti-Spoof Detection (§4.1)
-            const antiSpoofFlags = antiSpoofDetectorRef.current.processFrame({
-              timestamp: now,
-              faceCount: faceResult.faceLandmarks.length,
-              landmarks: hasFace ? (faceResult.faceLandmarks[0] as Landmark3D[]) : null,
-              blendshapes: blendshapeDict,
-              headPose,
-              downsampledPixels,
-              meanLuminance: meanLum,
-            });
-
-            if (antiSpoofFlags.length > 0) {
-              setActiveIntegrityFlags(antiSpoofFlags);
-              for (const flag of antiSpoofFlags) {
-                if (onAntiSpoofFlagRef.current) {
-                  onAntiSpoofFlagRef.current(flag);
+                const dCtx = downsamplerCtxRef.current;
+                if (dCtx) {
+                  dCtx.drawImage(video, 0, 0, 64, 36);
+                  const imgData = dCtx.getImageData(0, 0, 64, 36);
+                  const dArray = downsampledBufferRef.current;
+                  let lumSum = 0;
+                  for (let i = 0; i < 64 * 36; i++) {
+                    const r = imgData.data[i * 4];
+                    const g = imgData.data[i * 4 + 1];
+                    const b = imgData.data[i * 4 + 2];
+                    const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+                    dArray[i] = lum;
+                    lumSum += lum;
+                  }
+                  downsampledPixels = dArray;
+                  meanLum = lumSum / (64 * 36);
                 }
               }
-            } else if (activeIntegrityFlags.length > 0) {
-              setActiveIntegrityFlags([]);
+
+              // Run Passive Anti-Spoof Detection (§4.1)
+              const antiSpoofFlags = antiSpoofDetectorRef.current.processFrame({
+                timestamp: now,
+                faceCount: faceResult.faceLandmarks.length,
+                landmarks: hasFace ? (faceResult.faceLandmarks[0] as Landmark3D[]) : null,
+                blendshapes: blendshapeDict,
+                headPose,
+                downsampledPixels,
+                meanLuminance: meanLum,
+              });
+
+              if (antiSpoofFlags.length > 0) {
+                setActiveIntegrityFlags(antiSpoofFlags);
+                for (const flag of antiSpoofFlags) {
+                  if (onAntiSpoofFlagRef.current) {
+                    onAntiSpoofFlagRef.current(flag);
+                  }
+                }
+              } else if (activeIntegrityFlagsRef.current.length > 0) {
+                setActiveIntegrityFlags([]);
+              }
             }
 
             // Active Liveness Challenge Evaluation (§4.2)
-            if (challengeStatus === 'in_progress' && challengeList.length > 0) {
-              const currentStep = challengeList[currentStepIndex];
+            if (challengeStatusRef.current === 'in_progress' && challengeListRef.current.length > 0) {
+              const currentStep = challengeListRef.current[currentStepIndexRef.current];
               if (currentStep) {
                 const evalResult = challengeEvaluatorRef.current.evaluateFrame(
                   currentStep.action,
                   headPose,
                   blendshapeDict
                 );
+                setChallengeScore(evalResult.score);
 
                 if (evalResult.passed) {
-                  if (currentStepIndex + 1 < challengeList.length) {
-                    const nextIndex = currentStepIndex + 1;
+                  if (currentStepIndexRef.current + 1 < challengeListRef.current.length) {
+                    const nextIndex = currentStepIndexRef.current + 1;
                     setCurrentStepIndex(nextIndex);
+                    setChallengeScore(0);
                     challengeEvaluatorRef.current.reset();
 
                     if (challengeTimerRef.current) clearTimeout(challengeTimerRef.current);
                     challengeTimerRef.current = setTimeout(() => {
                       setChallengeStatus('failed');
-                    }, challengeList[nextIndex].timeoutMs);
+                      const failedStep = challengeListRef.current[nextIndex];
+                      if (onChallengeCompleteRef.current && failedStep) {
+                        onChallengeCompleteRef.current({
+                          challengeId: failedStep.id,
+                          nonce: failedStep.nonce,
+                          passed: false,
+                          score: 0,
+                          action: failedStep.action,
+                        });
+                      }
+                    }, challengeListRef.current[nextIndex].timeoutMs);
                   } else {
                     // All steps in sequence completed!
                     if (challengeTimerRef.current) clearTimeout(challengeTimerRef.current);
                     setChallengeStatus('passed');
+                    if (onChallengeCompleteRef.current) {
+                      onChallengeCompleteRef.current({
+                        challengeId: currentStep.id,
+                        nonce: currentStep.nonce,
+                        passed: true,
+                        score: evalResult.score,
+                        action: currentStep.action,
+                      });
+                    }
                   }
                 }
               }
@@ -665,8 +761,8 @@ export function useMediaPipeVision(
               );
               setLatestPacket(packet);
               setLatestMetrics({
-                eyeContactRatio: packet.face_present ? packet.eye_contact_ratio : null,
-                postureScore: packet.face_present ? packet.posture_score : null,
+                eyeContactRatio: packet.face_present && packet.eye_contact_ratio !== null ? packet.eye_contact_ratio : null,
+                postureScore: packet.face_present && packet.posture_score !== null ? packet.posture_score : null,
                 headPose: packet.face_present ? packet.head_pose : null,
                 expression: packet.face_present ? packet.expression : null,
                 distractionFlags: packet.distraction_flags,
@@ -691,11 +787,7 @@ export function useMediaPipeVision(
       }
     },
     [
-      activeIntegrityFlags.length,
       allowPhoneCamera,
-      challengeList,
-      challengeStatus,
-      currentStepIndex,
       initializeLandmarkers,
       stop,
       updateDeviceList,
@@ -714,6 +806,21 @@ export function useMediaPipeVision(
     },
     [startWithDeviceId]
   );
+
+  // Ensure video element receives stream whenever both are mounted and available
+  useEffect(() => {
+    if (
+      videoRef.current &&
+      mediaStreamRef.current &&
+      videoRef.current.srcObject !== mediaStreamRef.current
+    ) {
+      videoRef.current.srcObject = mediaStreamRef.current;
+      videoRef.current.playsInline = true;
+      videoRef.current.muted = true;
+      videoRef.current.autoplay = true;
+      videoRef.current.play().catch(() => {});
+    }
+  }, [status, externalStream]);
 
   useEffect(() => {
     if (autoStart) {
@@ -740,10 +847,12 @@ export function useMediaPipeVision(
     calibrationProgress,
     availableCameras,
     activeCameraLabel,
+    selectedDeviceId,
     isPhysicalVerified,
     activeIntegrityFlags,
     activeChallenge,
     challengeStatus,
+    challengeScore,
     startCalibration,
     selectCamera,
     startChallenge,

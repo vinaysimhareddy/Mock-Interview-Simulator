@@ -161,16 +161,17 @@ class PlausibilityChecker:
             recent_10 = self.packet_history[-10:]
             first_eye = recent_10[0].get("eye_contact_ratio", 0)
             first_posture = recent_10[0].get("posture_score", 0)
-            first_head = recent_10[0].get("head_pose", {})
+            first_head = recent_10[0].get("head_pose") or {}
 
             all_identical = all(
                 p.get("eye_contact_ratio") == first_eye
                 and p.get("posture_score") == first_posture
-                and p.get("head_pose", {}).get("yaw") == first_head.get("yaw")
-                and p.get("head_pose", {}).get("pitch") == first_head.get("pitch")
+                and (p.get("head_pose") or {}).get("yaw") == first_head.get("yaw")
+                and (p.get("head_pose") or {}).get("pitch") == first_head.get("pitch")
                 for p in recent_10
             )
-            if all_identical:
+            # Only flag identical telemetry as synthetic freeze if face was reported present
+            if all_identical and any(p.get("face_present") is not False for p in recent_10):
                 violations.append("plausibility_violation")
 
         # 3. Constant FPS or Zero Landmark Jitter
@@ -404,25 +405,36 @@ def is_telemetry_clean(sample: Dict[str, Any]) -> bool:
 
 def compute_verified_non_verbal_scores(
     samples: List[Dict[str, Any]],
-) -> Tuple[float, float, int]:
+) -> Tuple[Optional[float], Optional[float], int]:
     """
     Computes (eye_contact_ratio, posture_score, excluded_count) exclusively from verified-live segments (§7).
     Segments with active integrity flags are excluded.
+    Returns (None, None, excluded_count) if no clean verified samples are present.
     """
     if not samples:
-        return 0.85, 0.85, 0
+        return None, None, 0
 
     clean_samples = [s for s in samples if is_telemetry_clean(s)]
     excluded_count = len(samples) - len(clean_samples)
 
     if not clean_samples:
-        # Fallback if entire session was flagged
-        return 0.70, 0.70, excluded_count
+        return None, None, excluded_count
 
-    avg_eye = sum(s.get("eye_contact_ratio", 0.85) for s in clean_samples) / len(clean_samples)
-    avg_posture = sum(s.get("posture_score", 0.85) for s in clean_samples) / len(clean_samples)
+    eye_values = [
+        float(s["eye_contact_ratio"])
+        for s in clean_samples
+        if s.get("eye_contact_ratio") is not None
+    ]
+    posture_values = [
+        float(s["posture_score"])
+        for s in clean_samples
+        if s.get("posture_score") is not None
+    ]
 
-    return round(avg_eye, 3), round(avg_posture, 3), excluded_count
+    avg_eye = round(sum(eye_values) / len(eye_values), 3) if eye_values else None
+    avg_posture = round(sum(posture_values) / len(posture_values), 3) if posture_values else None
+
+    return avg_eye, avg_posture, excluded_count
 
 
 def build_integrity_summary(

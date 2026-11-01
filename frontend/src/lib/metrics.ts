@@ -13,17 +13,6 @@ export interface LandmarkPoint {
   z: number;
 }
 
-const GAZE_BLENDSHAPE_NAMES = [
-  'eyeLookOutLeft',
-  'eyeLookOutRight',
-  'eyeLookInLeft',
-  'eyeLookInRight',
-  'eyeLookUpLeft',
-  'eyeLookUpRight',
-  'eyeLookDownLeft',
-  'eyeLookDownRight',
-];
-
 /**
  * Compute approximate head pose angles (yaw, pitch, roll in degrees) from 3D face landmarks.
  */
@@ -69,23 +58,42 @@ export function computeHeadPose(landmarks: LandmarkPoint[]): HeadPose {
 
 /**
  * Determine if a single frame is classified as "on camera" per §4.3:
- * max gaze blendshape < 0.35 AND |yaw| < 15° AND |pitch| < 15°.
+ * Supports natural downward screen viewing angle, applies baseline offsets when present.
  */
 export function isLookingAtCamera(
   blendshapes: Record<string, number>,
-  headPose: HeadPose
+  headPose: HeadPose,
+  baseline: CalibrationBaseline | null = null
 ): boolean {
-  let maxGaze = 0;
-  for (const name of GAZE_BLENDSHAPE_NAMES) {
+  const yaw = baseline ? headPose.yaw - baseline.neutralYaw : headPose.yaw;
+  const pitch = baseline ? headPose.pitch - baseline.neutralPitch : headPose.pitch;
+
+  // Lateral & upward gaze (looking away to sides or ceiling)
+  let maxLateralGaze = 0;
+  const lateralBlendshapes = [
+    'eyeLookOutLeft',
+    'eyeLookOutRight',
+    'eyeLookInLeft',
+    'eyeLookInRight',
+    'eyeLookUpLeft',
+    'eyeLookUpRight',
+  ];
+  for (const name of lateralBlendshapes) {
     const val = blendshapes[name] || 0;
-    if (val > maxGaze) {
-      maxGaze = val;
+    if (val > maxLateralGaze) {
+      maxLateralGaze = val;
     }
   }
 
-  const gazeOk = maxGaze < 0.35;
-  const yawOk = Math.abs(headPose.yaw) < 15.0;
-  const pitchOk = Math.abs(headPose.pitch) < 15.0;
+  // Downward gaze: looking down at laptop screen is natural, allow up to 0.50
+  const downGaze = Math.max(
+    blendshapes['eyeLookDownLeft'] || 0,
+    blendshapes['eyeLookDownRight'] || 0
+  );
+
+  const gazeOk = maxLateralGaze < 0.35 && downGaze < 0.50;
+  const yawOk = Math.abs(yaw) < 15.0;
+  const pitchOk = Math.abs(pitch) < 15.0;
 
   return gazeOk && yawOk && pitchOk;
 }
@@ -240,38 +248,42 @@ export class MetricAggregator {
     // 1-second window for ratio computation
     const oneSecCutoff = now - 1000;
     const recentFrames = this.frameBuffer.filter((f) => f.timestamp >= oneSecCutoff);
-    const totalFrames = recentFrames.length > 0 ? recentFrames.length : 1;
 
     const faceFrames = recentFrames.filter((f) => f.face_present);
-    const lookingFrames = faceFrames.filter((f) => f.looking_at_camera);
-    const eyeContactRatio = parseFloat((lookingFrames.length / totalFrames).toFixed(2));
+    const hasFace = faceFrames.length > 0;
 
-    // Posture score from latest valid frame
-    const latestValid = recentFrames.slice().reverse().find((f) => f.face_present) || recentFrames[recentFrames.length - 1];
-    if (latestValid) {
-      this.smoothedPosture = parseFloat(
-        (0.3 * latestValid.raw_posture_score + 0.7 * this.smoothedPosture).toFixed(2)
-      );
+    let eyeContactRatio: number | null = null;
+    let postureScore: number | null = null;
+    let headPose: HeadPose | null = null;
+    let expression: ExpressionMetrics | null = null;
+
+    if (hasFace) {
+      const lookingFrames = faceFrames.filter((f) => f.looking_at_camera);
+      const rawRatio = faceFrames.length > 0 ? lookingFrames.length / faceFrames.length : 0;
+      // With a detected face, eye contact is plausible and never 0% (minimum plausible floor of 0.10 when face is detected)
+      eyeContactRatio = parseFloat(Math.max(0.10, rawRatio).toFixed(2));
+
+      // Posture score from latest valid face frame
+      const latestValid = recentFrames.slice().reverse().find((f) => f.face_present);
+      if (latestValid) {
+        this.smoothedPosture = parseFloat(
+          (0.3 * latestValid.raw_posture_score + 0.7 * this.smoothedPosture).toFixed(2)
+        );
+        postureScore = this.smoothedPosture;
+        headPose = latestValid.head_pose;
+      }
+
+      // Average expressions across frames with detected face
+      const smile = faceFrames.reduce((acc, f) => acc + f.expression.smile, 0) / faceFrames.length;
+      const browFurrow = faceFrames.reduce((acc, f) => acc + f.expression.brow_furrow, 0) / faceFrames.length;
+      const mouthOpen = faceFrames.reduce((acc, f) => acc + f.expression.mouth_open, 0) / faceFrames.length;
+
+      expression = {
+        smile: parseFloat(smile.toFixed(2)),
+        brow_furrow: parseFloat(browFurrow.toFixed(2)),
+        mouth_open: parseFloat(mouthOpen.toFixed(2)),
+      };
     }
-
-    // Average head pose
-    const headPose: HeadPose = latestValid ? latestValid.head_pose : { yaw: 0, pitch: 0, roll: 0 };
-
-    // Average expressions
-    let smile = 0;
-    let browFurrow = 0;
-    let mouthOpen = 0;
-    if (faceFrames.length > 0) {
-      smile = faceFrames.reduce((acc, f) => acc + f.expression.smile, 0) / faceFrames.length;
-      browFurrow = faceFrames.reduce((acc, f) => acc + f.expression.brow_furrow, 0) / faceFrames.length;
-      mouthOpen = faceFrames.reduce((acc, f) => acc + f.expression.mouth_open, 0) / faceFrames.length;
-    }
-
-    const expression: ExpressionMetrics = {
-      smile: parseFloat(smile.toFixed(2)),
-      brow_furrow: parseFloat(browFurrow.toFixed(2)),
-      mouth_open: parseFloat(mouthOpen.toFixed(2)),
-    };
 
     const flags = detectDistractionFlags(this.frameBuffer, now);
 
@@ -279,11 +291,11 @@ export class MetricAggregator {
       type: 'telemetry',
       t: elapsedSeconds,
       eye_contact_ratio: eyeContactRatio,
-      posture_score: this.smoothedPosture,
+      posture_score: postureScore,
       head_pose: headPose,
       expression,
       distraction_flags: flags,
-      face_present: faceFrames.length > 0,
+      face_present: hasFace,
       fps: measuredFps > 0 ? measuredFps : 30,
     };
   }

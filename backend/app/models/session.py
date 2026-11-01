@@ -54,6 +54,9 @@ class SessionCreate(BaseModel):
     integrity_mode: Literal["off", "advisory", "strict"] = Field(
         default="strict", description="Camera integrity enforcement mode: off | advisory | strict"
     )
+    max_questions: Optional[int] = Field(
+        default=None, description="Optional cap on question count (for testing); default None for unlimited"
+    )
 
     @property
     def role(self) -> str:

@@ -116,4 +116,91 @@ describe('Diagnostics Collector & Report (F6 / S6)', () => {
     expect(markdown).toContain('-48.0 dBFS');
     expect(markdown).toContain('Camera in use by Zoom');
   });
+
+  it('collects comprehensive audio diagnostics and speech engine state (§M5)', async () => {
+    const fakeAudioTrack = {
+      readyState: 'live',
+      enabled: true,
+      muted: false,
+      id: 'mic-trk-999',
+      label: 'USB Yeti Microphone',
+      getSettings: () => ({
+        channelCount: 1,
+        sampleRate: 48000,
+        echoCancellation: true,
+        noiseSuppression: true,
+      }),
+    };
+
+    const fakeAudioStream = {
+      getAudioTracks: () => [fakeAudioTrack],
+    } as unknown as MediaStream;
+
+    const fakeAudioContext = {
+      state: 'running',
+    } as unknown as AudioContext;
+
+    const report = await collectDiagnosticsReport({
+      audioStream: fakeAudioStream,
+      audioContext: fakeAudioContext,
+      lastGetUserMediaError: 'NotReadableError',
+      lastSpeechRecognitionError: 'audio-capture',
+    });
+
+    expect(report.audioDiagnostics).toBeDefined();
+    expect(report.audioDiagnostics.audioContextState).toBe('running');
+    expect(report.audioDiagnostics.activeAudioTrack?.label).toBe('USB Yeti Microphone');
+    expect(report.audioDiagnostics.activeAudioTrack?.readyState).toBe('live');
+    expect(report.audioDiagnostics.activeAudioTrack?.settings).toEqual({
+      channelCount: 1,
+      sampleRate: 48000,
+      echoCancellation: true,
+      noiseSuppression: true,
+    });
+    expect(report.audioDiagnostics.isAudioTrackMutedOrEnded).toBe(false);
+    expect(report.audioDiagnostics.lastGetUserMediaError).toBe('NotReadableError');
+    expect(report.audioDiagnostics.lastSpeechRecognitionError).toBe('audio-capture');
+
+    const markdown = formatDiagnosticsAsMarkdown(report);
+    expect(markdown).toContain('## Audio Diagnostics & Speech Engine (§M5)');
+    expect(markdown).toContain('AudioContext State: running');
+    expect(markdown).toContain('Active Audio Track: USB Yeti Microphone (live, muted=false)');
+    expect(markdown).toContain('Last getUserMedia Error: NotReadableError');
+    expect(markdown).toContain('Last SpeechRecognition Error: audio-capture');
+    expect(markdown).toContain('Active Audio Track Settings:');
+    expect(markdown).toContain('NO (Healthy)');
+  });
+
+  it('detects muted or ended audio track in diagnostics (§M5)', async () => {
+    const fakeMutedAudioTrack = {
+      readyState: 'ended',
+      enabled: true,
+      muted: true,
+      id: 'mic-trk-ended',
+      label: 'Disconnected Mic',
+      getSettings: () => ({}),
+    };
+
+    const fakeAudioStream = {
+      getAudioTracks: () => [fakeMutedAudioTrack],
+    } as unknown as MediaStream;
+
+    const report = await collectDiagnosticsReport({
+      audioStream: fakeAudioStream,
+      audioContext: { state: 'suspended' } as AudioContext,
+    });
+
+    expect(report.audioDiagnostics.isAudioTrackMutedOrEnded).toBe(true);
+    expect(report.audioDiagnostics.audioContextState).toBe('suspended');
+
+    const markdown = formatDiagnosticsAsMarkdown(report);
+    expect(markdown).toContain('Audio Track Muted/Ended: YES (Microphone lost or muted)');
+  });
+
+  it('handles permission query failure gracefully (§M5)', async () => {
+    const report = await collectDiagnosticsReport({});
+    expect(['granted', 'denied', 'prompt', 'unsupported', 'unknown']).toContain(
+      report.microphonePermission
+    );
+  });
 });

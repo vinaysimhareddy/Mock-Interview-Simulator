@@ -4,7 +4,6 @@ from httpx import ASGITransport, AsyncClient
 from app.main import app
 
 
-@pytest.mark.skip(reason="Scheduled for Phase 6 implementation")
 @pytest.mark.asyncio
 async def test_adaptive_interview_workflow_all_5_questions() -> None:
     """Run candidate through all 5 questions, verify dynamic difficulty changes, and check final report."""
@@ -26,11 +25,12 @@ async def test_adaptive_interview_workflow_all_5_questions() -> None:
         token = login_resp.json()["access_token"]
         headers = {"Authorization": f"Bearer {token}"}
 
-        # 2. Create Interview Session
+        # 2. Create Interview Session (5-question test workflow)
         sess_create_payload = {
             "role": "Distributed Systems Engineer",
             "seniority": "Senior",
             "difficulty": "Adaptive",
+            "max_questions": 5,
         }
         sess_resp = await client.post("/api/v1/sessions", headers=headers, json=sess_create_payload)
         assert sess_resp.status_code == 201
@@ -65,10 +65,10 @@ async def test_adaptive_interview_workflow_all_5_questions() -> None:
         ans1_data = ans1_resp.json()
         assert ans1_data["status"] == "IN_PROGRESS"
         assert ans1_data["current_question_index"] == 2
-        assert ans1_data["evaluation"]["score"] >= 8.0
+        assert ans1_data.get("evaluation") is None  # Withheld mid-interview to prevent bias
         assert ans1_data["difficulty_change"] == "UPGRADE"
         upgraded_diff = ans1_data["difficulty"]
-        assert upgraded_diff in ("Hard", "Staff")
+        assert upgraded_diff in ("Medium-Hard", "Hard", "Hard/Expert", "Staff")
 
         # 5. Question 2: Submit low-scoring answer (< 5.0) -> Triggers DOWNGRADE
         weak_answer = "I don't know much about that."
@@ -81,10 +81,10 @@ async def test_adaptive_interview_workflow_all_5_questions() -> None:
         ans2_data = ans2_resp.json()
         assert ans2_data["status"] == "IN_PROGRESS"
         assert ans2_data["current_question_index"] == 3
-        assert ans2_data["evaluation"]["score"] < 5.0
+        assert ans2_data.get("evaluation") is None  # Withheld mid-interview to prevent bias
         assert ans2_data["difficulty_change"] == "DOWNGRADE"
         downgraded_diff = ans2_data["difficulty"]
-        assert downgraded_diff in ("Medium", "Easy")
+        assert downgraded_diff in ("Medium", "Easy-Medium", "Easy")
 
         # 6. Question 3: Submit solid answer
         solid_ans3 = (
@@ -153,4 +153,6 @@ async def test_adaptive_interview_workflow_all_5_questions() -> None:
         state_data = state_resp.json()
         assert state_data["status"] == "COMPLETED"
         assert len(state_data["evaluations_history"]) == 5
+        assert state_data["evaluations_history"][0]["score"] >= 8.0
+        assert state_data["evaluations_history"][1]["score"] < 5.0
         assert len(state_data["conversation_history"]) >= 10

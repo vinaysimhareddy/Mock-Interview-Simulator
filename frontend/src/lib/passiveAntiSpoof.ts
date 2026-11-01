@@ -163,6 +163,16 @@ export class PassiveAntiSpoofDetector {
       faceCount,
     });
 
+    // --------------------------------------------------------------------------
+    // 1b. Camera Covered / Extreme Low Light (§4.1) - runs even if no face is visible
+    // --------------------------------------------------------------------------
+    const luminance = sample.meanLuminance ?? 120;
+    const isCovered = luminance < this.config.darkLuminanceThreshold;
+    updateCondition('camera_covered', isCovered, this.config.darkDurationMs, 0.95, {
+      luminance,
+      threshold: this.config.darkLuminanceThreshold,
+    });
+
     if (faceCount === 0 || !sample.landmarks) {
       // If face is absent, reset motion and blink timers to avoid false alarms
       this.lastBlinkTimestamp = now;
@@ -257,16 +267,6 @@ export class PassiveAntiSpoofDetector {
     }
     updateCondition('no_micro_motion', isLackOfMotion, 3000, 0.8, {
       historySamples: this.poseHistory.length,
-    });
-
-    // --------------------------------------------------------------------------
-    // 6. Camera Covered / Extreme Low Light (§4.1)
-    // --------------------------------------------------------------------------
-    const luminance = sample.meanLuminance ?? 120;
-    const isCovered = luminance < this.config.darkLuminanceThreshold;
-    updateCondition('camera_covered', isCovered, this.config.darkDurationMs, 0.95, {
-      luminance,
-      threshold: this.config.darkLuminanceThreshold,
     });
 
     // --------------------------------------------------------------------------

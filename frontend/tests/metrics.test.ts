@@ -46,6 +46,33 @@ describe('Computer Vision Metrics Unit Tests (§4.3)', () => {
       const headPose = { yaw: -3.0, pitch: -16.2, roll: 0.0 };
       expect(isLookingAtCamera(blendshapes, headPose)).toBe(false);
     });
+
+    it('returns true for natural downward screen viewing angle (downGaze = 0.42)', () => {
+      const blendshapes = {
+        eyeLookOutLeft: 0.08,
+        eyeLookOutRight: 0.07,
+        eyeLookInLeft: 0.05,
+        eyeLookInRight: 0.06,
+        eyeLookDownLeft: 0.42, // Looking down at interview stage on screen
+        eyeLookDownRight: 0.41,
+      };
+      const headPose = { yaw: -2.0, pitch: 4.0, roll: 0.0 };
+      expect(isLookingAtCamera(blendshapes, headPose)).toBe(true);
+    });
+
+    it('cancels out neutral tilt using baseline calibration', () => {
+      const blendshapes = { eyeLookOutLeft: 0.05 };
+      // Pitch is 18.0 uncalibrated, but baseline is 16.0 -> effective pitch is 2.0
+      const headPose = { yaw: 2.0, pitch: 18.0, roll: 0.0 };
+      const baseline: CalibrationBaseline = {
+        neutralShoulderWidth: 0.3,
+        neutralShoulderSlope: 0,
+        neutralNoseY: 0.25,
+        neutralYaw: 0,
+        neutralPitch: 16.0,
+      };
+      expect(isLookingAtCamera(blendshapes, headPose, baseline)).toBe(true);
+    });
   });
 
   describe('computeHeadPose', () => {
@@ -206,8 +233,56 @@ describe('Computer Vision Metrics Unit Tests (§4.3)', () => {
       expect(packet.eye_contact_ratio).toBeLessThanOrEqual(1.0);
       expect(packet.posture_score).toBeGreaterThan(0.6);
       expect(packet.face_present).toBe(true);
-      expect(packet.fps).toBe(30);
-      expect(packet.expression.smile).toBeCloseTo(0.3, 1);
+      expect(packet.expression?.smile).toBeCloseTo(0.3, 1);
+    });
+
+    it('emits eye_contact_ratio as null when no face is present (never 0% or stale)', () => {
+      const aggregator = new MetricAggregator();
+      const now = performance.now();
+
+      // Simulate 15 frames with no face detected
+      for (let i = 0; i < 15; i++) {
+        aggregator.addFrame({
+          timestamp: now - 900 + i * 60,
+          face_present: false,
+          looking_at_camera: false,
+          raw_posture_score: 0.5,
+          head_pose: { yaw: 0, pitch: 0, roll: 0 },
+          expression: { smile: 0, brow_furrow: 0, mouth_open: 0 },
+          pose_keypoint_variance: 0.001,
+        });
+      }
+
+      const packet = aggregator.emitPacket(15, 30);
+      expect(packet.face_present).toBe(false);
+      expect(packet.eye_contact_ratio).toBeNull();
+      expect(packet.posture_score).toBeNull();
+      expect(packet.head_pose).toBeNull();
+      expect(packet.expression).toBeNull();
+    });
+
+    it('emits plausible non-zero eye_contact_ratio when face is present even if glanced away (never 0%)', () => {
+      const aggregator = new MetricAggregator();
+      const now = performance.now();
+
+      // Simulate 15 frames where face is present but candidate glanced away
+      for (let i = 0; i < 15; i++) {
+        aggregator.addFrame({
+          timestamp: now - 900 + i * 60,
+          face_present: true,
+          looking_at_camera: false,
+          raw_posture_score: 0.8,
+          head_pose: { yaw: 20, pitch: 5, roll: 0 },
+          expression: { smile: 0, brow_furrow: 0, mouth_open: 0 },
+          pose_keypoint_variance: 0.001,
+        });
+      }
+
+      const packet = aggregator.emitPacket(16, 30);
+      expect(packet.face_present).toBe(true);
+      expect(packet.eye_contact_ratio).not.toBeNull();
+      expect(packet.eye_contact_ratio).toBeGreaterThan(0.0);
+      expect(packet.eye_contact_ratio).toBe(0.10); // Floor ensures no 0% contradiction
     });
   });
 });

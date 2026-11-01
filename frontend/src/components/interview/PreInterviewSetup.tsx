@@ -18,6 +18,7 @@ import {
   Lock,
   RotateCcw,
   Sun,
+  Copy,
 } from 'lucide-react';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -36,6 +37,8 @@ import {
 import { MIC_QUALITY_CONFIG } from '@/lib/micQualityConfig';
 import { useSetupDevices, mapCameraErrorToAction } from '@/hooks/useSetupDevices';
 import { useCameraStream } from '@/context/CameraStreamContext';
+import { generateMaskedDiagnostics } from '@/lib/maskedDiagnostics';
+import { mapSpeechRecognitionError } from '@/services/speech/speechErrors';
 import {
   CameraProofPipeline,
   attachStreamToVideo,
@@ -47,7 +50,6 @@ import {
 import { LivenessChallengeStep } from '@/lib/integrityTypes';
 import { PermissionHelpModal } from './PermissionHelpModal';
 import { DiagnosticsModal } from './DiagnosticsModal';
-import { recordGetUserMediaCall } from '@/lib/diagnosticsCollector';
 import {
   evaluateFaceQuality,
   FaceQualityHysteresis,
@@ -84,9 +86,10 @@ export function PreInterviewSetup({
   // State Machine for all hardware & liveness states
   const { state, dispatch, isAllReady } = useSetupDevices();
 
-  // Shared Camera Provider
+  // Shared Media Stream Provider
   const {
     stream: cameraStream,
+    videoStream,
     selectedDeviceId,
     availableCameras,
     acquireCamera,
@@ -94,7 +97,15 @@ export function PreInterviewSetup({
     setSelectedDeviceId,
     refreshCameras,
     retainForInterview,
+    audioStream,
     setAudioStream,
+    acquireAudio,
+    releaseAudio,
+    availableMicrophones,
+    selectedMicDeviceId,
+    setSelectedMicDeviceId,
+    refreshMicrophones,
+    activeMicLabel,
   } = useCameraStream();
 
   const isHandingOverRef = useRef<boolean>(false);
@@ -116,6 +127,7 @@ export function PreInterviewSetup({
   const [speakerError, setSpeakerError] = useState<string | null>(null);
   const [isHelpModalOpen, setIsHelpModalOpen] = useState<boolean>(false);
   const [isDiagnosticsOpen, setIsDiagnosticsOpen] = useState<boolean>(false);
+  const [diagnosticsCopied, setDiagnosticsCopied] = useState<boolean>(false);
 
   // Face Quality & Camera Verification State
   const [faceQualityReport, setFaceQualityReport] = useState<FaceQualityReport | null>(null);
@@ -157,6 +169,11 @@ export function PreInterviewSetup({
   const audioAnimRef = useRef<number | null>(null);
   const ttsRef = useRef<BrowserTextToSpeech | null>(null);
   const sttRef = useRef<BrowserSpeechToText | null>(null);
+  const speechStartedRef = useRef<boolean>(false);
+  const [liveSpeechTranscript, setLiveSpeechTranscript] = useState<string>('');
+  const [sttNotice, setSttNotice] = useState<string | null>(null);
+  const [lastMicErrorName, setLastMicErrorName] = useState<string | null>(null);
+  const [lastSttErrorCode, setLastSttErrorCode] = useState<string | null>(null);
 
   const durationPresets = [10, 15, 20, 30, 45, 60];
   const questionEstimate = estimateQuestionRange(durationMinutes);
@@ -175,11 +192,36 @@ export function PreInterviewSetup({
   // Initialize Audio & Speech Services + Preload Vision Models
   useEffect(() => {
     ttsRef.current = new BrowserTextToSpeech();
-    sttRef.current = new BrowserSpeechToText();
+    const stt = new BrowserSpeechToText();
+    sttRef.current = stt;
+
+    const unsubscribeSTT = stt.onTranscript((event) => {
+      if (event.fullTranscript) {
+        setLiveSpeechTranscript(event.fullTranscript);
+      } else if (event.text) {
+        setLiveSpeechTranscript(event.text);
+      }
+    });
+
+    const unsubscribeSTTError = stt.onError((err) => {
+      setLastSttErrorCode(err.error);
+      if (
+        err.error === 'network' ||
+        err.error === 'audio-capture' ||
+        err.error === 'service-not-allowed'
+      ) {
+        const errorInfo = mapSpeechRecognitionError(err.error);
+        setSttNotice(`${errorInfo.title}: ${errorInfo.explanation}`);
+      }
+    });
+
     refreshCameras();
+    refreshMicrophones();
     preloadVisionModels().catch(() => {});
 
     return () => {
+      unsubscribeSTT();
+      unsubscribeSTTError();
       detectionLoopActiveRef.current = false;
       if (detectionLoopIdRef.current) cancelAnimationFrame(detectionLoopIdRef.current);
       if (cameraTimeoutRef.current) clearTimeout(cameraTimeoutRef.current);
@@ -187,17 +229,21 @@ export function PreInterviewSetup({
       if (detectionTimeoutRef.current) clearTimeout(detectionTimeoutRef.current);
       if (autoCaptureTimerRef.current) clearTimeout(autoCaptureTimerRef.current);
       if (audioAnimRef.current) cancelAnimationFrame(audioAnimRef.current);
-      if (audioContextRef.current) audioContextRef.current.close().catch(() => {});
+      if (audioContextRef.current && !isHandingOverRef.current) {
+        audioContextRef.current.close().catch(() => {});
+        audioContextRef.current = null;
+      }
       if (ttsRef.current) ttsRef.current.stop();
+      if (sttRef.current) sttRef.current.stop();
       if (pipelineRef.current) pipelineRef.current.stop();
 
       // Only shut down tracks if not handing over to active interview room
       if (!isHandingOverRef.current) {
-        if (audioStreamRef.current) audioStreamRef.current.getTracks().forEach((t) => t.stop());
+        releaseAudio();
         releaseCamera();
       }
     };
-  }, [refreshCameras, releaseCamera]);
+  }, [refreshCameras, refreshMicrophones, releaseCamera, releaseAudio]);
 
   // --- 1. CAMERA PIPELINE & GUIDED FACE DETECTION ---
 
@@ -622,176 +668,309 @@ export function PreInterviewSetup({
   }, [currentChallengeIdx, challengeSequence, dispatch]);
 
   // --- 3. MICROPHONE AUDIO & LATCHED QUALITY CALIBRATION ---
-  const handleStartMic = useCallback(async () => {
-    dispatch({ type: 'MIC_REQUEST' });
-    noiseFloorCalibratorRef.current.reset();
-    voicedAccumulatorRef.current.reset();
-    setMicReport(null);
+  const handleStartMic = useCallback(
+    async (targetDeviceId?: string) => {
+      dispatch({ type: 'MIC_REQUEST' });
+      setLastMicErrorName(null);
+      speechStartedRef.current = false;
+      setLiveSpeechTranscript('');
+      setSttNotice(null);
+      noiseFloorCalibratorRef.current.reset();
+      voicedAccumulatorRef.current.reset();
+      setMicReport(null);
 
-    try {
-      // Reuse existing live audio stream if already acquired
-      let stream = audioStreamRef.current;
-      const isExistingLive =
-        stream &&
-        stream.active &&
-        stream.getAudioTracks().length > 0 &&
-        stream.getAudioTracks()[0].readyState === 'live';
+      try {
+        const stream = await acquireAudio(targetDeviceId ?? selectedMicDeviceId);
 
-      if (!isExistingLive || !stream) {
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-          video: false,
-        });
-        recordGetUserMediaCall('audio');
+        if (!stream) {
+          throw new Error('Unable to acquire audio stream.');
+        }
+
         audioStreamRef.current = stream;
-      }
 
-      if (!stream) {
-        throw new Error('Unable to acquire audio stream.');
-      }
+        // Attach track disconnect & mute event listeners to revert verification if hardware is lost
+        const audioTrack = stream.getAudioTracks()[0];
+        if (audioTrack) {
+          audioTrack.onended = () => {
+            dispatch({
+              type: 'MIC_LOST',
+              reason: 'Microphone track ended or device disconnected.',
+            });
+          };
+          audioTrack.onmute = () => {
+            dispatch({
+              type: 'MIC_LOST',
+              reason: 'Microphone hardware muted or unavailable.',
+            });
+          };
+        }
 
-      // Attach track disconnect & mute event listeners to revert verification if hardware is lost
-      const audioTrack = stream.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.onended = () => {
-          dispatch({
-            type: 'MIC_LOST',
-            reason: 'Microphone track ended or device disconnected.',
-          });
-        };
-        audioTrack.onmute = () => {
-          dispatch({
-            type: 'MIC_LOST',
-            reason: 'Microphone hardware muted or unavailable.',
-          });
-        };
-      }
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+        if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+          audioContextRef.current = new AudioCtx();
+        }
+        const audioCtx = audioContextRef.current;
+        if (audioCtx.state === 'suspended') {
+          await audioCtx.resume();
+        }
 
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const audioCtx = audioContextRef.current ?? new AudioCtx();
-      audioContextRef.current = audioCtx;
-      if (audioCtx.state === 'suspended') {
-        await audioCtx.resume();
-      }
-
-      const source = audioCtx.createMediaStreamSource(stream);
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 512;
-      analyser.smoothingTimeConstant = 0.3;
-      source.connect(analyser);
-      analyserRef.current = analyser;
-
-      const floatBuffer = new Float32Array(analyser.fftSize);
-      const byteBuffer = new Uint8Array(analyser.frequencyBinCount);
-
-      const updateMeter = () => {
-        if (!analyserRef.current) return;
-
-        if (analyser.getFloatTimeDomainData) {
-          analyser.getFloatTimeDomainData(floatBuffer);
-        } else {
-          analyser.getByteTimeDomainData(byteBuffer);
-          for (let i = 0; i < byteBuffer.length; i++) {
-            floatBuffer[i] = (byteBuffer[i] - 128) / 128;
+        if (analyserRef.current) {
+          try {
+            analyserRef.current.disconnect();
+          } catch {
+            // ignore
           }
         }
 
-        const rms = computeRMS(floatBuffer);
-        const peak = computePeak(floatBuffer);
-        const levelPct = Math.min(100, Math.round(rms * 250));
-        setAudioLevel(levelPct);
+        const source = audioCtx.createMediaStreamSource(stream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.3;
+        source.connect(analyser);
+        analyserRef.current = analyser;
 
-        const now = performance.now();
-        const calibrator = noiseFloorCalibratorRef.current;
-        const accumulator = voicedAccumulatorRef.current;
+        const floatBuffer = new Float32Array(analyser.fftSize);
+        const byteBuffer = new Uint8Array(analyser.frequencyBinCount);
 
-        // Stage 1: Noise Floor Calibration (1.0 s)
-        if (!calibrator.isCalibrated(now)) {
-          calibrator.addSample(rms, now);
-          dispatch({
-            type: 'MIC_MEASURING_NOISE',
-            noiseFloorDb: calibrator.getAverageDb(),
-          });
-          audioAnimRef.current = requestAnimationFrame(updateMeter);
-          return;
+        if (audioAnimRef.current) {
+          cancelAnimationFrame(audioAnimRef.current);
+          audioAnimRef.current = null;
         }
 
-        const noiseFloorRms = calibrator.getAverageRms();
-        const noiseFloorDb = calibrator.getAverageDb();
+        const updateMeter = () => {
+          if (!analyserRef.current) return;
 
-        // Voiced threshold: RMS >= noise floor + 10 dB and >= min speech RMS
-        const voicedThresholdRms =
-          noiseFloorRms * Math.pow(10, MIC_QUALITY_CONFIG.VOICED_DELTA_DB / 20);
-        const isVoiced = rms >= voicedThresholdRms && rms >= MIC_QUALITY_CONFIG.MIN_AVERAGE_SPEECH_RMS;
+          if (analyser.getFloatTimeDomainData) {
+            analyser.getFloatTimeDomainData(floatBuffer);
+          } else {
+            analyser.getByteTimeDomainData(byteBuffer);
+            for (let i = 0; i < byteBuffer.length; i++) {
+              floatBuffer[i] = (byteBuffer[i] - 128) / 128;
+            }
+          }
 
-        const cumulativeVoicedMs = accumulator.update(now, isVoiced);
-        const cumulativeVoicedSec = cumulativeVoicedMs / 1000;
-        const targetSec = MIC_QUALITY_CONFIG.REQUIRED_VOICED_DURATION_MS / 1000;
+          const rms = computeRMS(floatBuffer);
+          const peak = computePeak(floatBuffer);
+          const levelPct = Math.min(100, Math.round(rms * 250));
+          setAudioLevel(levelPct);
 
-        const report = evaluateMicQuality({
-          currentRms: rms,
-          peakAmplitude: peak,
-          noiseFloorRms,
-          noiseFloorDb,
-          isNoiseFloorCalibrated: true,
-          cumulativeVoicedSeconds: cumulativeVoicedSec,
-          targetVoicedSeconds: targetSec,
+          const now = performance.now();
+          const calibrator = noiseFloorCalibratorRef.current;
+          const accumulator = voicedAccumulatorRef.current;
+
+          // Stage 1: Noise Floor Calibration (1.0 s)
+          if (!calibrator.isCalibrated(now)) {
+            calibrator.addSample(rms, now);
+            dispatch({
+              type: 'MIC_MEASURING_NOISE',
+              noiseFloorDb: calibrator.getAverageDb(),
+            });
+            audioAnimRef.current = requestAnimationFrame(updateMeter);
+            return;
+          }
+
+          // Stage 2: Collecting Speech & SpeechRecognition Self-Test
+          if (sttRef.current && !speechStartedRef.current && sttSupported) {
+            speechStartedRef.current = true;
+            try {
+              sttRef.current.start();
+            } catch {
+              // ignore
+            }
+          }
+
+          const noiseFloorRms = calibrator.getAverageRms();
+          const noiseFloorDb = calibrator.getAverageDb();
+
+          // Voiced threshold: RMS >= noise floor + 10 dB and >= min speech RMS
+          const voicedThresholdRms =
+            noiseFloorRms * Math.pow(10, MIC_QUALITY_CONFIG.VOICED_DELTA_DB / 20);
+          const isVoiced = rms >= voicedThresholdRms && rms >= MIC_QUALITY_CONFIG.MIN_AVERAGE_SPEECH_RMS;
+
+          const cumulativeVoicedMs = accumulator.update(now, isVoiced);
+          const cumulativeVoicedSec = cumulativeVoicedMs / 1000;
+          const targetSec = MIC_QUALITY_CONFIG.REQUIRED_VOICED_DURATION_MS / 1000;
+
+          const report = evaluateMicQuality({
+            currentRms: rms,
+            peakAmplitude: peak,
+            noiseFloorRms,
+            noiseFloorDb,
+            isNoiseFloorCalibrated: true,
+            cumulativeVoicedSeconds: cumulativeVoicedSec,
+            targetVoicedSeconds: targetSec,
+          });
+
+          setMicReport(report);
+          setNoiseDetected(!calibrator.isAcceptable() || rms > 0.25);
+
+          if (report.overallPassed) {
+            if (sttRef.current && speechStartedRef.current) {
+              speechStartedRef.current = false;
+              try {
+                sttRef.current.stop();
+              } catch {
+                // ignore
+              }
+            }
+            dispatch({
+              type: 'MIC_VERIFY',
+              level: levelPct,
+              snrDb: report.estimatedSnrDb,
+              noiseFloorDb,
+              voicedSeconds: cumulativeVoicedSec,
+            });
+          } else {
+            dispatch({
+              type: 'MIC_COLLECTING_SPEECH',
+              voicedSeconds: cumulativeVoicedSec,
+              targetSeconds: targetSec,
+              snrDb: report.estimatedSnrDb,
+              level: levelPct,
+              hint: report.primaryHint,
+            });
+          }
+
+          audioAnimRef.current = requestAnimationFrame(updateMeter);
+        };
+
+        updateMeter();
+      } catch (err) {
+        const errName = err instanceof Error ? err.name : 'UnknownError';
+        const errMsg = err instanceof Error ? err.message : String(err);
+        setLastMicErrorName(errName);
+
+        console.error('[DIAGNOSTIC MIC FAILURE]', {
+          errorName: errName,
+          errorMessage: errMsg,
+          selectedMicDeviceId,
+          audioContextState: audioContextRef.current?.state ?? 'null',
         });
 
-        setMicReport(report);
-        setNoiseDetected(!calibrator.isAcceptable() || rms > 0.25);
-
-        if (report.overallPassed) {
+        if (err instanceof Error && err.name === 'NotAllowedError') {
           dispatch({
-            type: 'MIC_VERIFY',
-            level: levelPct,
-            snrDb: report.estimatedSnrDb,
-            noiseFloorDb,
-            voicedSeconds: cumulativeVoicedSec,
+            type: 'MIC_DENIED',
+            error:
+              'Microphone permission blocked. Click the lock/tune icon in your address bar, set Microphone to Allow, then click Try Again.',
+            cause: 'not_allowed',
+          });
+        } else if (err instanceof Error && err.name === 'NotFoundError') {
+          dispatch({
+            type: 'MIC_ERROR',
+            error:
+              'No microphone detected. Plug in a headset or webcam microphone, then click Check Devices.',
+            cause: 'not_found',
+          });
+        } else if (
+          err instanceof Error &&
+          (err.name === 'NotReadableError' || err.name === 'AbortError')
+        ) {
+          dispatch({
+            type: 'MIC_ERROR',
+            error:
+              'Your microphone is in use by another app (e.g. Zoom, Teams, Meet) or exclusive mode is enabled. Close other apps and click Try Again.',
+            cause: 'not_readable',
+          });
+        } else if (err instanceof Error && err.name === 'OverconstrainedError') {
+          dispatch({
+            type: 'MIC_ERROR',
+            error:
+              'Requested audio settings not supported by this microphone. Switching to default settings…',
+            cause: 'overconstrained',
+          });
+        } else if (err instanceof Error && err.name === 'SecurityError') {
+          dispatch({
+            type: 'MIC_ERROR',
+            error: 'Microphone requires HTTPS or localhost.',
+            cause: 'security',
           });
         } else {
           dispatch({
-            type: 'MIC_COLLECTING_SPEECH',
-            voicedSeconds: cumulativeVoicedSec,
-            targetSeconds: targetSec,
-            snrDb: report.estimatedSnrDb,
-            level: levelPct,
-            hint: report.primaryHint,
+            type: 'MIC_ERROR',
+            error:
+              'Unable to connect to microphone device. Please verify your audio settings and click Try Again.',
+            cause: 'generic',
           });
         }
-
-        audioAnimRef.current = requestAnimationFrame(updateMeter);
-      };
-
-      updateMeter();
-    } catch (err) {
-      if (err instanceof Error && err.name === 'NotAllowedError') {
-        dispatch({
-          type: 'MIC_DENIED',
-          error: 'Microphone permission blocked. Please allow microphone access in address bar.',
-        });
-      } else {
-        dispatch({
-          type: 'MIC_ERROR',
-          error: 'Unable to connect to microphone device.',
-        });
       }
-    }
-  }, [dispatch]);
+    },
+    [acquireAudio, selectedMicDeviceId, dispatch]
+  );
+
+  const handleSwitchMicrophone = useCallback(
+    async (deviceId: string) => {
+      setSelectedMicDeviceId(deviceId);
+      if (audioAnimRef.current) {
+        cancelAnimationFrame(audioAnimRef.current);
+        audioAnimRef.current = null;
+      }
+      noiseFloorCalibratorRef.current.reset();
+      voicedAccumulatorRef.current.reset();
+      setMicReport(null);
+      await handleStartMic(deviceId);
+    },
+    [setSelectedMicDeviceId, handleStartMic]
+  );
 
   const handleRetestMic = useCallback(() => {
     if (audioAnimRef.current) {
       cancelAnimationFrame(audioAnimRef.current);
       audioAnimRef.current = null;
     }
+    if (sttRef.current) {
+      try {
+        sttRef.current.stop();
+      } catch {
+        // ignore
+      }
+    }
+    speechStartedRef.current = false;
+    setLiveSpeechTranscript('');
+    setSttNotice(null);
+    setLastMicErrorName(null);
+    setLastSttErrorCode(null);
     noiseFloorCalibratorRef.current.reset();
     voicedAccumulatorRef.current.reset();
     setMicReport(null);
     dispatch({ type: 'MIC_RESET' });
-    handleStartMic();
-  }, [handleStartMic, dispatch]);
+    void handleStartMic(selectedMicDeviceId);
+  }, [handleStartMic, selectedMicDeviceId, dispatch]);
+
+  const handleCheckDevices = useCallback(async () => {
+    await refreshMicrophones();
+    handleRetestMic();
+  }, [refreshMicrophones, handleRetestMic]);
+
+  const handleCopyDiagnostics = useCallback(() => {
+    const errorText =
+      state.mic.status === 'denied' || state.mic.status === 'error'
+        ? state.mic.error
+        : undefined;
+    const cause =
+      state.mic.status === 'denied' || state.mic.status === 'error'
+        ? state.mic.cause
+        : undefined;
+
+    const text = generateMaskedDiagnostics({
+      errorName: cause || 'MicrophoneConnectionError',
+      errorMessage: errorText,
+      cause,
+      audioContextState: audioContextRef.current?.state,
+      devices: availableMicrophones,
+    });
+
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      navigator.clipboard
+        .writeText(text)
+        .then(() => {
+          setDiagnosticsCopied(true);
+          setTimeout(() => setDiagnosticsCopied(false), 2500);
+        })
+        .catch(() => {});
+    }
+  }, [state.mic, availableMicrophones]);
 
   // Support E2E automation for speech verification in headless environments where physical mic input isn't present
   useEffect(() => {
@@ -848,11 +1027,12 @@ export function PreInterviewSetup({
     if (!isAllReady || !consentAccepted) return;
     isHandingOverRef.current = true;
     retainForInterview();
-    setAudioStream(audioStreamRef.current);
+    const finalAudioStream = audioStream ?? audioStreamRef.current;
+    setAudioStream(finalAudioStream);
     onStartInterview({
       durationMinutes,
-      videoStream: cameraStream,
-      audioStream: audioStreamRef.current,
+      videoStream: videoStream ?? cameraStream,
+      audioStream: finalAudioStream,
     });
   };
 
@@ -991,7 +1171,7 @@ export function PreInterviewSetup({
                   Local Privacy Protection
                 </div>
                 <p className="text-[11px] text-slate-400 leading-relaxed">
-                  Your video stays inside your browser. Only numeric telemetry signals (such as head pose and eye metrics) are sent to the server. No video or photos are saved or uploaded.
+                  Your camera and microphone are on during the interview. Camera monitoring and facial analysis run entirely on your device. Spoken answers are transcribed using your browser’s speech recognition service. Only numeric behavior signals and the transcribed text of your answers are saved. No raw audio or video recordings are stored on our servers.
                 </p>
               </div>
 
@@ -1492,6 +1672,10 @@ export function PreInterviewSetup({
                     Run Diagnostics
                   </Button>
                 </div>
+
+                <p className="text-[10px] text-slate-500 pt-1 leading-relaxed border-t border-slate-900/60">
+                  Your camera and microphone are on during the interview. Camera monitoring and facial analysis run entirely on your device. Spoken answers are transcribed using your browser’s speech recognition service. Only numeric behavior signals and the transcribed text of your answers are saved. No raw audio or video recordings are stored on our servers.
+                </p>
               </div>
 
               {/* 2. Liveness Section (Gated on Camera Verification) */}
@@ -1632,36 +1816,89 @@ export function PreInterviewSetup({
                     <Button
                       size="sm"
                       variant="outline"
-                      onClick={handleStartMic}
+                      onClick={() => void handleStartMic()}
                       className="text-xs border-indigo-800 text-indigo-300 hover:bg-indigo-950/60 h-7"
                     >
                       Connect Mic
                     </Button>
                   </div>
                 ) : state.mic.status === 'denied' || state.mic.status === 'error' ? (
-                  <div className="p-2.5 rounded-xl bg-rose-950/40 border border-rose-900/60 space-y-1.5">
-                    <p className="text-xs text-rose-300">
-                      {state.mic.status === 'denied' ? state.mic.error : state.mic.error}
-                    </p>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={handleRetestMic}
-                        className="text-xs border-rose-700 text-rose-300 hover:bg-rose-900/50 h-6"
-                      >
-                        Try Again
-                      </Button>
+                  <div className="p-3 rounded-xl bg-rose-950/40 border border-rose-900/60 space-y-2">
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle className="h-4 w-4 text-rose-400 shrink-0 mt-0.5" />
+                      <div className="space-y-1 flex-1">
+                        <p className="text-xs text-rose-200 font-medium leading-relaxed">
+                          {state.mic.error}
+                        </p>
+                        {state.mic.status === 'error' && state.mic.speechError && (
+                          <p className="text-[11px] text-rose-300/80">
+                            Speech engine: {state.mic.speechError}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center flex-wrap gap-2 pt-1 border-t border-rose-900/40">
+                      {state.mic.cause === 'not_found' ? (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void handleCheckDevices()}
+                          className="text-xs border-rose-700 bg-rose-950/60 text-rose-200 hover:bg-rose-900/70 h-7"
+                        >
+                          <RefreshCw className="h-3 w-3 mr-1" />
+                          Check Devices
+                        </Button>
+                      ) : state.mic.cause === 'overconstrained' ? (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={handleRetestMic}
+                          className="text-xs border-rose-700 bg-rose-950/60 text-rose-200 hover:bg-rose-900/70 h-7"
+                        >
+                          Switch to Defaults
+                        </Button>
+                      ) : (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={handleRetestMic}
+                          className="text-xs border-rose-700 bg-rose-950/60 text-rose-200 hover:bg-rose-900/70 h-7"
+                        >
+                          Try Again
+                        </Button>
+                      )}
+
                       {state.mic.status === 'denied' && (
                         <Button
                           size="sm"
-                          variant="ghost"
+                          variant="outline"
                           onClick={() => setIsHelpModalOpen(true)}
-                          className="h-6 text-xs text-rose-400 hover:text-rose-300 underline"
+                          className="h-7 text-xs border-indigo-800 text-indigo-300 hover:bg-indigo-950/60"
                         >
                           Permission Help
                         </Button>
                       )}
+
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={handleCopyDiagnostics}
+                        className="h-7 text-xs text-slate-300 hover:text-white hover:bg-slate-900/60 gap-1 ml-auto"
+                        title="Copy diagnostic report for support"
+                      >
+                        {diagnosticsCopied ? (
+                          <>
+                            <Check className="h-3 w-3 text-emerald-400" />
+                            <span className="text-emerald-400">Copied!</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="h-3 w-3 text-slate-400" />
+                            <span>Copy Diagnostics</span>
+                          </>
+                        )}
+                      </Button>
                     </div>
                   </div>
                 ) : (
@@ -1727,13 +1964,25 @@ export function PreInterviewSetup({
                         </div>
 
                         {/* Speech Sentence Prompt & Live Status */}
-                        <div className="space-y-1 flex-1 min-w-0">
+                        <div className="space-y-1.5 flex-1 min-w-0">
                           <p className="text-xs font-semibold text-white">
-                            Say: &apos;My name is ___ and I&apos;m ready for the interview&apos;
+                            Say: &apos;My name is ___ and I&apos;m ready for the interview&apos; (or &apos;testing one two three&apos;)
                           </p>
-                          <p className="text-[11px] text-indigo-300">
-                            {micReport?.primaryHint || state.mic.hint || `Listening… keep speaking (${state.mic.voicedSeconds.toFixed(1)} / 1.5 s)`}
-                          </p>
+                          {liveSpeechTranscript ? (
+                            <div className="p-1.5 rounded-md bg-indigo-950/80 border border-indigo-700/60 font-mono text-[11px] text-white">
+                              <span className="text-indigo-400 font-semibold mr-1">Heard:</span>
+                              &ldquo;{liveSpeechTranscript}&rdquo;
+                            </div>
+                          ) : (
+                            <p className="text-[11px] text-indigo-300">
+                              {micReport?.primaryHint || state.mic.hint || `Listening… speak test phrase (${state.mic.voicedSeconds.toFixed(1)} / 1.5 s)`}
+                            </p>
+                          )}
+                          {sttNotice && (
+                            <p className="text-[10px] text-amber-300">
+                              {sttNotice}
+                            </p>
+                          )}
                         </div>
                       </div>
                     )}
@@ -1742,21 +1991,29 @@ export function PreInterviewSetup({
                       <div
                         aria-live="polite"
                         role="status"
-                        className="p-2.5 rounded-xl bg-emerald-950/30 border border-emerald-900/50 flex items-center justify-between text-xs text-emerald-300"
+                        className="p-2.5 rounded-xl bg-emerald-950/30 border border-emerald-900/50 flex flex-col gap-1.5 text-xs text-emerald-300"
                       >
-                        <span className="flex items-center gap-1.5 font-medium">
-                          <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
-                          Clear voice detected ✓ (SNR: {state.mic.snrDb ? `${state.mic.snrDb.toFixed(1)} dB` : '15+ dB'}). Input latched.
-                        </span>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={handleRetestMic}
-                          className="h-6 text-[10px] text-emerald-400 hover:text-emerald-200 hover:bg-emerald-900/40 underline"
-                          aria-label="Re-test microphone"
-                        >
-                          Re-test
-                        </Button>
+                        <div className="flex items-center justify-between">
+                          <span className="flex items-center gap-1.5 font-medium">
+                            <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                            Clear voice detected ✓ (SNR: {state.mic.snrDb ? `${state.mic.snrDb.toFixed(1)} dB` : '15+ dB'}). Input latched.
+                          </span>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={handleRetestMic}
+                            className="h-6 text-[10px] text-emerald-400 hover:text-emerald-200 hover:bg-emerald-900/40 underline shrink-0"
+                            aria-label="Re-test microphone"
+                          >
+                            Re-test
+                          </Button>
+                        </div>
+                        {liveSpeechTranscript && (
+                          <div className="pl-5 text-[11px] text-emerald-200/90 font-mono">
+                            <span className="text-emerald-400 font-semibold mr-1">Recognized:</span>
+                            &ldquo;{liveSpeechTranscript}&rdquo;
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -1768,6 +2025,36 @@ export function PreInterviewSetup({
                     )}
                   </div>
                 )}
+
+                {/* Microphone Device Selector */}
+                <div className="flex items-center justify-between text-[11px] text-slate-400 px-1 pt-1 border-t border-slate-900">
+                  <div className="flex items-center gap-2 truncate max-w-[280px]">
+                    <span className="truncate" title={activeMicLabel || availableMicrophones[0]?.label}>
+                      Mic: <strong className="text-slate-300">{activeMicLabel || availableMicrophones[0]?.label || 'Default Microphone'}</strong>
+                    </span>
+                    {availableMicrophones.length > 1 && (
+                      <select
+                        value={selectedMicDeviceId}
+                        onChange={(e) => void handleSwitchMicrophone(e.target.value)}
+                        className="bg-slate-900 border border-slate-800 text-slate-300 rounded px-1.5 py-0.5 text-[10px] max-w-[150px] truncate"
+                        aria-label="Select microphone"
+                      >
+                        {availableMicrophones.map((m, i) => (
+                          <option key={m.deviceId || i} value={m.deviceId}>
+                            {m.label || `Microphone ${i + 1}`}
+                          </option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
+                  {state.mic.status === 'verified' && (
+                    <span className="text-[10px] text-emerald-400 font-mono">Active</span>
+                  )}
+                </div>
+
+                <p className="text-[10px] text-slate-500 pt-1 leading-relaxed border-t border-slate-900/60">
+                  Your camera and microphone are on during the interview. Camera monitoring and facial analysis run entirely on your device. Spoken answers are transcribed using your browser’s speech recognition service. Only numeric behavior signals and the transcribed text of your answers are saved. No raw audio or video recordings are stored on our servers.
+                </p>
               </div>
 
               {/* 4. Speaker Output & Verification Code Test */}
@@ -1885,6 +2172,7 @@ export function PreInterviewSetup({
       <PermissionHelpModal
         isOpen={isHelpModalOpen}
         onClose={() => setIsHelpModalOpen(false)}
+        onRetry={handleRetestMic}
       />
 
       {/* Diagnostics Report Modal */}
@@ -1892,6 +2180,8 @@ export function PreInterviewSetup({
         isOpen={isDiagnosticsOpen}
         onClose={() => setIsDiagnosticsOpen(false)}
         stream={cameraStream}
+        audioStream={audioStream ?? audioStreamRef.current}
+        audioContext={audioContextRef.current}
         videoEl={videoRef.current}
         measuredFps={pipelineRef.current?.getStatus().fps}
         meanLuminance={pipelineRef.current?.getStatus().luminance}
@@ -1941,6 +2231,8 @@ export function PreInterviewSetup({
             ? (state.camera as { error: string }).error
             : null
         }
+        lastGetUserMediaError={lastMicErrorName}
+        lastSpeechRecognitionError={lastSttErrorCode}
       />
     </div>
   );

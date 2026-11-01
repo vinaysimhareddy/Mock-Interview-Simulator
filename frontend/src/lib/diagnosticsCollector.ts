@@ -61,11 +61,34 @@ export interface DiagnosticsReport {
     audio: number;
     total: number;
   };
+  audioDiagnostics: {
+    speechRecognitionSupported: boolean;
+    audioContextState: string;
+    audioInputs: Array<{
+      deviceId: string;
+      label: string;
+      isDeviceIdEmpty: boolean;
+      groupId: string;
+    }>;
+    activeAudioTrack: {
+      readyState: string;
+      enabled: boolean;
+      muted: boolean;
+      id: string;
+      label: string;
+      settings?: MediaTrackSettings;
+    } | null;
+    isAudioTrackMutedOrEnded: boolean;
+    lastGetUserMediaError: string | null;
+    lastSpeechRecognitionError: string | null;
+  };
   lastError: string | null;
 }
 
 export interface CollectDiagnosticsOptions {
   stream?: MediaStream | null;
+  audioStream?: MediaStream | null;
+  audioContext?: AudioContext | null;
   videoEl?: HTMLVideoElement | null;
   measuredFps?: number;
   meanLuminance?: number;
@@ -80,6 +103,8 @@ export interface CollectDiagnosticsOptions {
   estimatedSnrDb?: number | null;
   voicedSeconds?: number | null;
   lastError?: string | null;
+  lastGetUserMediaError?: string | null;
+  lastSpeechRecognitionError?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +208,52 @@ export async function collectDiagnosticsReport(
   const visionDiagnostics = getVisionDiagnostics();
   const mediaCounts = getGetUserMediaCounts();
 
+  const speechSupported =
+    typeof window !== 'undefined' &&
+    Boolean(
+      window.SpeechRecognition ||
+        (window as unknown as { webkitSpeechRecognition?: unknown }).webkitSpeechRecognition
+    );
+
+  const audioInputs: DiagnosticsReport['audioDiagnostics']['audioInputs'] = [];
+  devices
+    .filter((d) => d.kind === 'audioinput')
+    .forEach((d) => {
+      audioInputs.push({
+        deviceId: d.deviceId,
+        label: d.label || '(Unlabeled audio input)',
+        isDeviceIdEmpty: !d.deviceId || d.deviceId.length === 0,
+        groupId: '',
+      });
+    });
+
+  let activeAudioTrack: DiagnosticsReport['audioDiagnostics']['activeAudioTrack'] = null;
+  let isAudioTrackMutedOrEnded = false;
+  if (options.audioStream) {
+    const aTrack = options.audioStream.getAudioTracks()[0];
+    if (aTrack) {
+      activeAudioTrack = {
+        readyState: aTrack.readyState,
+        enabled: aTrack.enabled,
+        muted: aTrack.muted,
+        id: aTrack.id,
+        label: aTrack.label || '(Unlabeled Audio Track)',
+        settings: aTrack.getSettings ? aTrack.getSettings() : {},
+      };
+      isAudioTrackMutedOrEnded = aTrack.muted || aTrack.readyState === 'ended';
+    }
+  }
+
+  const audioDiagnostics = {
+    speechRecognitionSupported: speechSupported,
+    audioContextState: options.audioContext?.state ?? 'null',
+    audioInputs,
+    activeAudioTrack,
+    isAudioTrackMutedOrEnded,
+    lastGetUserMediaError: options.lastGetUserMediaError ?? null,
+    lastSpeechRecognitionError: options.lastSpeechRecognitionError ?? null,
+  };
+
   return {
     timestamp: new Date().toISOString(),
     isSecureContext: isSecure,
@@ -215,6 +286,7 @@ export async function collectDiagnosticsReport(
     },
     visionDelegate: visionDiagnostics,
     getUserMediaCalls: mediaCounts,
+    audioDiagnostics,
     lastError: options.lastError ?? null,
   };
 }
@@ -272,5 +344,22 @@ export function formatDiagnosticsAsMarkdown(report: DiagnosticsReport): string {
     `- Estimated Speech SNR: ${report.audioQuality.estimatedSnrDb !== null ? `${report.audioQuality.estimatedSnrDb.toFixed(1)} dB` : 'N/A'}`,
     `- Cumulative Voiced Speech: ${report.audioQuality.voicedSeconds !== null ? `${report.audioQuality.voicedSeconds.toFixed(1)} s / 1.5 s` : 'N/A'}`,
     `- Last Reported Error: ${report.lastError || 'None'}`,
+    ``,
+    `## Audio Diagnostics & Speech Engine (§M5)`,
+    `- Secure Context: ${report.isSecureContext ? 'YES (Microphone access permitted)' : 'NO (Microphone blocked by browser)'}`,
+    `- Microphone Permission: ${report.microphonePermission}`,
+    `- SpeechRecognition Supported: ${report.audioDiagnostics.speechRecognitionSupported ? 'YES' : 'NO'}`,
+    `- AudioContext State: ${report.audioDiagnostics.audioContextState}`,
+    `- Last getUserMedia Error: ${report.audioDiagnostics.lastGetUserMediaError || 'None'}`,
+    `- Last SpeechRecognition Error: ${report.audioDiagnostics.lastSpeechRecognitionError || 'None'}`,
+    `- Active Audio Track: ${report.audioDiagnostics.activeAudioTrack ? `${report.audioDiagnostics.activeAudioTrack.label} (${report.audioDiagnostics.activeAudioTrack.readyState}, muted=${report.audioDiagnostics.activeAudioTrack.muted})` : 'None'}`,
+    ...(report.audioDiagnostics.activeAudioTrack?.settings && Object.keys(report.audioDiagnostics.activeAudioTrack.settings).length > 0
+      ? [`- Active Audio Track Settings: ${JSON.stringify(report.audioDiagnostics.activeAudioTrack.settings)}`]
+      : []),
+    `- Audio Track Muted/Ended: ${report.audioDiagnostics.isAudioTrackMutedOrEnded ? 'YES (Microphone lost or muted)' : 'NO (Healthy)'}`,
+    `- Audio Input Devices (${report.audioDiagnostics.audioInputs.length}):`,
+    ...report.audioDiagnostics.audioInputs.map(
+      (m) => `  - ${m.label || '(Unlabeled)'} [ID: ${m.isDeviceIdEmpty ? 'EMPTY' : m.deviceId.slice(0, 8) + '...'}]`
+    ),
   ].join('\n');
 }

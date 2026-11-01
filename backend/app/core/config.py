@@ -104,6 +104,48 @@ class Settings(BaseSettings):
         description="API key for Google Gemini models",
     )
 
+    # Embedding and RAG Configuration (§2.3, §4)
+    EMBEDDING_PROVIDER: str = Field(
+        default="openai",
+        description="Active embedding provider: 'openai' or 'google'",
+    )
+    EMBEDDING_MODEL: str = Field(
+        default="text-embedding-3-small",
+        description="Embedding model name",
+    )
+    EMBEDDING_DIMENSIONS: int = Field(
+        default=1536,
+        description="Embedding vector dimensions (must match Atlas vector index)",
+    )
+    RAG_TOP_K: int = Field(
+        default=4,
+        description="Number of chunks retrieved per query source",
+    )
+    RAG_MAX_CONTEXT_TOKENS: int = Field(
+        default=1800,
+        description="Maximum token budget for retrieved context",
+    )
+    VECTOR_INDEX_RESUME: str = Field(
+        default="resume_chunks_vector",
+        description="Atlas vector search index name for resume chunks",
+    )
+    VECTOR_INDEX_KB: str = Field(
+        default="knowledge_base_vector",
+        description="Atlas vector search index name for knowledge base",
+    )
+    VECTOR_INDEX_MEMORY: str = Field(
+        default="interview_memory_vector",
+        description="Atlas vector search index name for interview memory",
+    )
+    DUPLICATE_SIMILARITY_THRESHOLD: float = Field(
+        default=0.88,
+        description="Cosine similarity threshold above which a question is deemed duplicate",
+    )
+    MAX_FOLLOWUPS_PER_TOPIC: int = Field(
+        default=2,
+        description="Maximum consecutive follow-up probes allowed per topic",
+    )
+
     # Upload and Storage Limits
     MAX_UPLOAD_MB: int = Field(
         default=5,
@@ -126,6 +168,10 @@ class Settings(BaseSettings):
     INTEGRITY_MODE: str = Field(
         default="strict",
         description="Client camera integrity policy mode: 'off' | 'advisory' | 'strict'",
+    )
+    SUPPORT_EMAIL: str = Field(
+        default="support@ai-interviewer.com",
+        description="Public technical support email contact for candidate assistance",
     )
 
     @property

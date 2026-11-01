@@ -214,6 +214,66 @@ pytest
 
 ---
 
-## 7. License
+## 7. Microphone Troubleshooting & Acquisition Guide
+
+If you experience `"Unable to connect to microphone device"` or an error during pre-interview audio setup, consult the steps below:
+
+### 7.1 Operating System Permission Paths
+
+#### Windows 10 & 11
+1. Open **Windows Settings** (`Win + I`) → **Privacy & security** → **Microphone**.
+2. Ensure **Microphone access** is turned **On**.
+3. Ensure **Let apps access your microphone** is turned **On**.
+4. Scroll down to **Let desktop apps access your microphone** and verify it is turned **On**. Both Google Chrome and Microsoft Edge require this setting.
+5. If using a third-party antivirus or endpoint protection suite (Kaspersky, Bitdefender, Norton), verify that its "Webcam & Microphone Protection" feature is not actively blocking browser audio capture.
+
+#### macOS (Ventura, Sonoma, Sequoia)
+1. Open **System Settings** → **Privacy & Security** → **Microphone**.
+2. Locate your browser (**Google Chrome**, **Microsoft Edge**, or **Brave**) in the application list and toggle the switch to **On**.
+3. If the browser is open, quit and restart the browser for permission updates to take effect.
+
+---
+
+### 7.2 Browser Site Permissions (Chrome & Edge)
+1. Click the **Tune / Lock** icon located immediately to the left of the URL in your browser's address bar.
+2. In the site settings dropdown, verify that **Microphone** is explicitly set to **Allow** (not "Block" or "Ask").
+3. Alternatively, navigate directly to `chrome://settings/content/microphone` (Chrome) or `edge://settings/content/microphone` (Edge) and confirm that this domain is listed under **"Allowed to use your microphone"**.
+4. Reload the page after updating permissions.
+
+---
+
+### 7.3 Resolving Device Busy & Exclusive Mode Conflicts (`NotReadableError` / `AbortError`)
+Windows devices and certain USB audio interfaces restrict simultaneous microphone access:
+1. **Close Competing Applications:** Ensure apps such as Zoom, Microsoft Teams, Google Meet, Discord, Skype, OBS Studio, Audacity, or other browser tabs with open audio streams are closed.
+2. **Disable Windows Exclusive Mode:**
+   - Press `Win + R`, type `mmsys.cpl`, and press **Enter** to open the Sound Control Panel.
+   - Navigate to the **Recording** tab, select your microphone, and click **Properties**.
+   - Select the **Advanced** tab.
+   - Uncheck **"Allow applications to take exclusive control of this device"**.
+   - Click **Apply**, then **OK**, and reload the interview setup page.
+
+---
+
+### 7.4 System Default Audio Input Device & Web Speech API
+- The browser Web Speech API (`webkitSpeechRecognition`) connects strictly to the operating system's **default communication microphone**. Unlike `getUserMedia`, the speech recognition engine cannot be redirected to a custom device identifier via code.
+- **Windows:** Go to **Settings → System → Sound**. Under **Input**, select your preferred physical microphone and ensure it is designated as the **Default Device**.
+- **macOS:** Go to **System Settings → Sound → Input** and click your preferred physical microphone.
+
+---
+
+### 7.5 Bluetooth Headsets & Hands-Free Audio Bandwidth
+- When a Bluetooth headset (Apple AirPods, Sony WH-1000XM, Bose QC, Jabra) activates its microphone, the Bluetooth stack switches from high-fidelity A2DP stereo playback to the **Hands-Free Profile (HFP/SCO)**, reducing microphone sampling bandwidth to 8 kHz or 16 kHz.
+- This profile switch can introduce audio latency, muffled frequency response, or momentary driver re-initialization.
+- For optimal speech-to-text accuracy and lower latency during technical interviews, a wired 3.5mm headset or a dedicated USB condenser microphone is recommended.
+
+---
+
+### 7.6 Speech Recognition Connectivity
+- Spoken responses are transcribed using your browser's speech recognition engine (in Chromium browsers, this routes through Google speech recognition servers).
+- An active internet connection is required. If running inside an enterprise corporate network, ensure that outbound access to speech recognition endpoints (`*.googleapis.com`) is not restricted by corporate proxy inspection or firewall policies.
+
+---
+
+## 8. License
 
 MIT License. Designed and engineered for privacy-preserving AI mock interview simulations.

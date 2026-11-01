@@ -107,3 +107,5 @@ class InterviewStepResponse(BaseModel):
     difficulty: str
     difficulty_change: Optional[str] = None  # "UPGRADE" | "DOWNGRADE" | "UNCHANGED"
     final_report: Optional[FinalReport] = None
+    current_action: Optional[str] = None
+    question_sources: Optional[List[Dict[str, Any]]] = None

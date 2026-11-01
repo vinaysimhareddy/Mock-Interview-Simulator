@@ -82,6 +82,18 @@ class ResumeRepository:
         resume["parsed_data"] = profile_update
         return resume
 
+    async def delete_by_id_and_user(self, resume_id: str, user_id: str) -> bool:
+        """Delete a resume by ID ensuring strict user ownership isolation."""
+        resume = await self.get_by_id_and_user(resume_id, user_id)
+        if not resume:
+            return False
+
+        target_id: Union[ObjectId, str] = (
+            ObjectId(resume["id"]) if ObjectId.is_valid(resume["id"]) else resume["id"]
+        )
+        result = await self.collection.delete_one({"_id": target_id, "user_id": str(user_id)})
+        return result.deleted_count > 0
+
     def _format(self, doc: Dict[str, Any]) -> Dict[str, Any]:
         data = dict(doc)
         doc_id = str(data.get("_id") or data.get("id"))

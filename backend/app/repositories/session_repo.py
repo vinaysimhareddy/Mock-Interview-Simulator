@@ -22,6 +22,7 @@ class SessionRepository:
         difficulty: str = "Adaptive",
         integrity_mode: str = "strict",
         resume_id: Optional[str] = None,
+        max_questions: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Create a new interview session record in interview_sessions."""
         session_id = str(uuid.uuid4())
@@ -38,6 +39,7 @@ class SessionRepository:
             "seniority": target_seniority,
             "difficulty": difficulty or "Adaptive",
             "integrity_mode": integrity_mode or "strict",
+            "max_questions": max_questions,
             "status": "CREATED",
             "session_status": "created",
             "created_at": now,

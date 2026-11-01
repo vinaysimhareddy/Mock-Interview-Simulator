@@ -170,6 +170,10 @@ class MongoManager:
             ("integrity_events", [("session_id", ASCENDING), ("t", ASCENDING)], {}),
             # evaluations collection
             ("evaluations", [("session_id", ASCENDING)], {"unique": True}),
+            # RAG vector collections (§2.3, Q2, Q3)
+            ("resume_chunks", [("user_id", ASCENDING), ("resume_id", ASCENDING)], {}),
+            ("knowledge_base", [("role", ASCENDING), ("seniority", ASCENDING)], {}),
+            ("interview_memory", [("session_id", ASCENDING)], {}),
         ]
 
         for col_name, keys, kwargs in index_specs:
@@ -198,6 +202,8 @@ class MongoManager:
             "telemetry_samples",
             "integrity_events",
             "evaluations",
+            "resume_chunks",
+            "interview_memory",
         ]
         for col in collections:
             try:

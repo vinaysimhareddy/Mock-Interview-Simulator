@@ -16,16 +16,38 @@ export interface ExpressionMetrics {
   mouth_open: number;
 }
 
+export interface IntegrityFlagItem {
+  flag: string;
+  confidence?: number;
+}
+
+export interface IntegrityPayload {
+  camera_label_hash?: string;
+  device_id_hash?: string;
+  track_state?: string;
+  resolution?: string;
+  measured_fps?: number;
+  frame_diff_mean?: number;
+  landmark_jitter?: number;
+  luminance_mean?: number;
+  faces_detected?: number;
+  flags?: Array<IntegrityFlagItem | string>;
+  challenge?: Record<string, unknown>;
+  seq?: number;
+  hmac?: string;
+}
+
 export interface TelemetrySample {
   type: 'telemetry';
-  t: number;                       // seconds since interview start
-  eye_contact_ratio: number;     // 0..1 fraction looking at camera in 1s window
-  posture_score: number;         // 0..1 posture quality score
-  head_pose: HeadPose;
-  expression: ExpressionMetrics;
+  t: number;                           // seconds since interview start
+  eye_contact_ratio: number | null;     // 0..1 fraction looking at camera in 1s window, null if face not present
+  posture_score: number | null;         // 0..1 posture quality score, null if face not present
+  head_pose: HeadPose | null;
+  expression: ExpressionMetrics | null;
   distraction_flags: DistractionFlag[];
   face_present: boolean;
   fps: number;
+  integrity?: IntegrityPayload;
 }
 
 export interface FrameMetricSnapshot {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ClientWSMessage, ServerWSMessage } from '../lib/types';
+import { ClientWSMessage, ServerWSMessage, TelemetrySample } from '../lib/types';
+import { computeTelemetryHmac, sha256Hex } from '../lib/hmacSignature';
 
 export type WebSocketConnectionStatus =
   | 'idle'
@@ -23,7 +24,13 @@ export interface UseWebSocketInterviewReturn {
   isConnected: boolean;
   reconnectCount: number;
   error: string | null;
+  ackedPacketCount: number;
+  hmacKey: string | null;
   send: (message: ClientWSMessage) => boolean;
+  sendTelemetry: (
+    sample: TelemetrySample,
+    meta?: { cameraLabel?: string; deviceId?: string }
+  ) => Promise<boolean>;
   disconnect: () => void;
   connect: () => void;
 }
@@ -42,12 +49,16 @@ export function useWebSocketInterview({
   const [status, setStatus] = useState<WebSocketConnectionStatus>('idle');
   const [error, setError] = useState<string | null>(null);
   const [reconnectCount, setReconnectCount] = useState<number>(0);
+  const [ackedPacketCount, setAckedPacketCount] = useState<number>(0);
+  const [hmacKey, setHmacKey] = useState<string | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectAttemptsRef = useRef<number>(0);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messageQueueRef = useRef<ClientWSMessage[]>([]);
   const isManuallyClosedRef = useRef<boolean>(false);
+  const hmacKeyRef = useRef<string | null>(null);
+  const seqRef = useRef<number>(0);
 
   // Keep latest callbacks in refs to avoid stale closures
   const onMessageRef = useRef(onMessage);
@@ -90,6 +101,17 @@ export function useWebSocketInterview({
   }, []);
 
   const send = useCallback((message: ClientWSMessage): boolean => {
+    // Ensure monotonic sequence is attached if telemetry is sent directly via send()
+    if (message.type === 'telemetry') {
+      if (!message.integrity || message.integrity.seq === undefined) {
+        seqRef.current += 1;
+        message.integrity = {
+          ...message.integrity,
+          seq: seqRef.current,
+        };
+      }
+    }
+
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
       try {
         socketRef.current.send(JSON.stringify(message));
@@ -105,6 +127,53 @@ export function useWebSocketInterview({
       return false;
     }
   }, []);
+
+  const sendTelemetry = useCallback(
+    async (
+      sample: TelemetrySample,
+      meta?: { cameraLabel?: string; deviceId?: string }
+    ): Promise<boolean> => {
+      seqRef.current += 1;
+      const seq = seqRef.current;
+
+      const cameraLabelHash = meta?.cameraLabel
+        ? await sha256Hex(meta.cameraLabel)
+        : sample.integrity?.camera_label_hash;
+      const deviceIdHash = meta?.deviceId
+        ? await sha256Hex(meta.deviceId)
+        : sample.integrity?.device_id_hash;
+
+      let hmacSig: string | undefined = undefined;
+      const key = hmacKeyRef.current;
+      if (key) {
+        hmacSig = await computeTelemetryHmac(
+          key,
+          sample.t,
+          seq,
+          cameraLabelHash,
+          deviceIdHash,
+          sample.fps
+        );
+      }
+
+      const signedPacket: TelemetrySample = {
+        ...sample,
+        integrity: {
+          ...sample.integrity,
+          seq,
+          hmac: hmacSig,
+          camera_label_hash: cameraLabelHash,
+          device_id_hash: deviceIdHash,
+          measured_fps: sample.fps,
+          faces_detected: sample.face_present ? (sample.integrity?.faces_detected ?? 1) : 0,
+          flags: sample.integrity?.flags || [],
+        },
+      };
+
+      return send(signedPacket);
+    },
+    [send]
+  );
 
   const connect = useCallback(() => {
     if (!sessionId || !token) {
@@ -123,6 +192,8 @@ export function useWebSocketInterview({
     isManuallyClosedRef.current = false;
     setStatus(reconnectAttemptsRef.current > 0 ? 'reconnecting' : 'connecting');
     setError(null);
+    seqRef.current = 0;
+    setAckedPacketCount(0);
 
     // Compute ws protocol and host
     const isHttps = window.location.protocol === 'https:';
@@ -151,10 +222,18 @@ export function useWebSocketInterview({
           }
 
           if (data.type === 'session_ready') {
+            if (data.hmac_key) {
+              hmacKeyRef.current = data.hmac_key;
+              setHmacKey(data.hmac_key);
+            }
             setStatus('connected');
             flushQueue();
             if (onSessionReadyRef.current) {
               onSessionReadyRef.current(data.session_id);
+            }
+          } else if (data.type === 'ack') {
+            if (data.received_type === 'telemetry') {
+              setAckedPacketCount((prev) => prev + 1);
             }
           } else if (data.type === 'interview_complete') {
             if (onInterviewCompleteRef.current) {
@@ -233,7 +312,10 @@ export function useWebSocketInterview({
     isConnected: status === 'connected',
     reconnectCount,
     error,
+    ackedPacketCount,
+    hmacKey,
     send,
+    sendTelemetry,
     disconnect,
     connect,
   };

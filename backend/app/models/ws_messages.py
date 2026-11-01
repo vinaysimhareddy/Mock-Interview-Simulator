@@ -51,13 +51,17 @@ class IntegrityPayload(BaseModel):
 class TelemetryMessage(BaseModel):
     type: Literal["telemetry"] = "telemetry"
     t: float = Field(..., ge=0, description="Seconds elapsed since interview start")
-    eye_contact_ratio: float = Field(
-        ..., ge=0.0, le=1.0, description="Fraction of frames in last 1s looking at camera"
+    eye_contact_ratio: Optional[float] = Field(
+        default=None, ge=0.0, le=1.0, description="Fraction of frames in last 1s looking at camera"
     )
-    posture_score: float = Field(..., ge=0.0, le=1.0, description="0..1 posture quality score")
-    head_pose: HeadPose = Field(..., description="Head orientation angles (yaw, pitch, roll)")
-    expression: FacialExpression = Field(
-        default_factory=FacialExpression, description="Facial blendshapes"
+    posture_score: Optional[float] = Field(
+        default=None, ge=0.0, le=1.0, description="0..1 posture quality score"
+    )
+    head_pose: Optional[HeadPose] = Field(
+        default=None, description="Head orientation angles (yaw, pitch, roll)"
+    )
+    expression: Optional[FacialExpression] = Field(
+        default=None, description="Facial blendshapes"
     )
     distraction_flags: List[DistractionFlag] = Field(
         default_factory=list, description="Distraction flags detected in window"

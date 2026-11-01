@@ -38,7 +38,7 @@ export default defineConfig(({ mode }) => {
     test: {
       globals: true,
       environment: 'node',
-      include: ['tests/**/*.test.ts'],
+      include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
     },
   };
 });

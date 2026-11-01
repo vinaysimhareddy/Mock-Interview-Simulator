@@ -38,6 +38,15 @@ export type CameraState =
   | { status: 'lost'; reason: string }
   | { status: 'error'; error: string };
 
+export type MicErrorCause =
+  | 'not_allowed'
+  | 'not_found'
+  | 'not_readable'
+  | 'overconstrained'
+  | 'security'
+  | 'speech_recognition'
+  | 'generic';
+
 export type MicState =
   | { status: 'idle' }
   | { status: 'requesting' }
@@ -58,8 +67,8 @@ export type MicState =
       noiseFloorDb?: number;
       voicedSeconds?: number;
     }
-  | { status: 'denied'; error: string }
-  | { status: 'error'; error: string };
+  | { status: 'denied'; error: string; cause?: MicErrorCause }
+  | { status: 'error'; error: string; cause?: MicErrorCause; speechError?: string };
 
 export type SpeakerState =
   | { status: 'idle' }
@@ -138,8 +147,8 @@ export type SetupDevicesAction =
       noiseFloorDb?: number;
       voicedSeconds?: number;
     }
-  | { type: 'MIC_DENIED'; error: string }
-  | { type: 'MIC_ERROR'; error: string }
+  | { type: 'MIC_DENIED'; error: string; cause?: MicErrorCause }
+  | { type: 'MIC_ERROR'; error: string; cause?: MicErrorCause; speechError?: string }
   | { type: 'MIC_LOST'; reason: string }
   | { type: 'MIC_RESET' }
 
@@ -406,19 +415,32 @@ export function setupDevicesReducer(
     case 'MIC_DENIED':
       return {
         ...state,
-        mic: { status: 'denied', error: action.error },
+        mic: {
+          status: 'denied',
+          error: action.error,
+          cause: action.cause || 'not_allowed',
+        },
       };
 
     case 'MIC_ERROR':
       return {
         ...state,
-        mic: { status: 'error', error: action.error },
+        mic: {
+          status: 'error',
+          error: action.error,
+          cause: action.cause || 'generic',
+          speechError: action.speechError,
+        },
       };
 
     case 'MIC_LOST':
       return {
         ...state,
-        mic: { status: 'error', error: action.reason },
+        mic: {
+          status: 'error',
+          error: action.reason,
+          cause: 'not_readable',
+        },
       };
 
     case 'MIC_RESET':

@@ -1,5 +1,6 @@
 from unittest.mock import AsyncMock, patch
 import pytest
+from bson import ObjectId
 from httpx import ASGITransport, AsyncClient
 
 from app.core.database import get_database
@@ -103,7 +104,7 @@ async def test_upload_sample_pdf_parsed_profile_saved() -> None:
 
             # Verify persisted in database
             db = await get_database()
-            saved_doc = await db["resumes"].find_one({"_id": resume_id})
+            saved_doc = await db["resumes"].find_one({"$or": [{"_id": ObjectId(resume_id)}, {"_id": resume_id}, {"id": resume_id}]})
             assert saved_doc is not None
             assert saved_doc["parsed_profile"]["experience_years"] == 5.5
 

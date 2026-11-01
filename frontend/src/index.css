@@ -2,6 +2,133 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  color-scheme: dark;
+@layer base {
+  :root {
+    --background: 220 20% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 238 84% 59%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 214 32% 91%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 214 32% 93%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 214 32% 91%;
+    --accent-foreground: 222 47% 11%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214 32% 88%;
+    --input: 214 32% 88%;
+    --ring: 238 84% 59%;
+    --radius: 1rem;
+    color-scheme: light;
+  }
+
+  .dark {
+    --background: 224 71% 4%;
+    --foreground: 210 40% 98%;
+    --card: 224 71% 7%;
+    --card-foreground: 210 40% 98%;
+    --popover: 224 71% 7%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 238 84% 67%;
+    --primary-foreground: 222 47% 11%;
+    --secondary: 217 33% 17%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217 33% 14%;
+    --muted-foreground: 215 20% 65%;
+    --accent: 217 33% 17%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 33% 18%;
+    --input: 217 33% 18%;
+    --ring: 238 84% 67%;
+    --radius: 1rem;
+    color-scheme: dark;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground transition-colors duration-200;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+}
+
+/* Animations for AI Interviewer Stage */
+@keyframes orb-breathe {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 0.85;
+  }
+  50% {
+    transform: scale(1.08);
+    opacity: 1;
+  }
+}
+
+@keyframes orb-pulse-fast {
+  0%, 100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.15);
+  }
+}
+
+@keyframes orb-spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes orbit-dots {
+  from {
+    transform: rotate(0deg) translateX(54px) rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg) translateX(54px) rotate(-360deg);
+  }
+}
+
+.animate-orb-breathe {
+  animation: orb-breathe 4s ease-in-out infinite;
+}
+
+.animate-orb-pulse-fast {
+  animation: orb-pulse-fast 1.2s ease-in-out infinite;
+}
+
+.animate-orb-spin-slow {
+  animation: orb-spin-slow 18s linear infinite;
+}
+
+.animate-orbit-dots {
+  animation: orbit-dots 3s linear infinite;
+}
+
+/* Reduced Motion Override */
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .animate-orb-breathe,
+  .animate-orb-pulse-fast,
+  .animate-orb-spin-slow,
+  .animate-orbit-dots {
+    animation: none !important;
+  }
 }

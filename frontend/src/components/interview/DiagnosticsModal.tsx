@@ -27,6 +27,8 @@ export interface DiagnosticsModalProps {
   isOpen: boolean;
   onClose: () => void;
   stream?: MediaStream | null;
+  audioStream?: MediaStream | null;
+  audioContext?: AudioContext | null;
   videoEl?: HTMLVideoElement | null;
   measuredFps?: number;
   meanLuminance?: number;
@@ -41,12 +43,16 @@ export interface DiagnosticsModalProps {
   estimatedSnrDb?: number | null;
   voicedSeconds?: number | null;
   lastError?: string | null;
+  lastGetUserMediaError?: string | null;
+  lastSpeechRecognitionError?: string | null;
 }
 
 export function DiagnosticsModal({
   isOpen,
   onClose,
   stream,
+  audioStream,
+  audioContext,
   videoEl,
   measuredFps,
   meanLuminance,
@@ -61,6 +67,8 @@ export function DiagnosticsModal({
   estimatedSnrDb,
   voicedSeconds,
   lastError,
+  lastGetUserMediaError,
+  lastSpeechRecognitionError,
 }: DiagnosticsModalProps): React.ReactElement | null {
   const [report, setReport] = useState<DiagnosticsReport | null>(null);
   const [copied, setCopied] = useState<boolean>(false);
@@ -70,6 +78,8 @@ export function DiagnosticsModal({
     setIsLoading(true);
     const data = await collectDiagnosticsReport({
       stream,
+      audioStream,
+      audioContext,
       videoEl,
       measuredFps,
       meanLuminance,
@@ -84,6 +94,8 @@ export function DiagnosticsModal({
       estimatedSnrDb,
       voicedSeconds,
       lastError,
+      lastGetUserMediaError,
+      lastSpeechRecognitionError,
     });
     setReport(data);
     setIsLoading(false);
@@ -96,6 +108,8 @@ export function DiagnosticsModal({
   }, [
     isOpen,
     stream,
+    audioStream,
+    audioContext,
     videoEl,
     measuredFps,
     meanLuminance,
@@ -110,6 +124,8 @@ export function DiagnosticsModal({
     estimatedSnrDb,
     voicedSeconds,
     lastError,
+    lastGetUserMediaError,
+    lastSpeechRecognitionError,
   ]);
 
   if (!isOpen) return null;
@@ -159,7 +175,7 @@ export function DiagnosticsModal({
           {report ? (
             <>
               {/* Quick Status Pill Bar */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
                 <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
                   <span className="text-[10px] text-slate-500 uppercase block font-sans">Context</span>
                   <span className="text-xs font-semibold text-white flex items-center gap-1 mt-0.5">
@@ -185,7 +201,19 @@ export function DiagnosticsModal({
                 </div>
 
                 <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
-                  <span className="text-[10px] text-slate-500 uppercase block font-sans">Track Status</span>
+                  <span className="text-[10px] text-slate-500 uppercase block font-sans">Mic Perm</span>
+                  <span className="text-xs font-semibold text-white flex items-center gap-1 mt-0.5">
+                    {report.microphonePermission === 'granted' ? (
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
+                    ) : (
+                      <ShieldCheck className="h-3.5 w-3.5 text-amber-400 shrink-0" />
+                    )}
+                    {report.microphonePermission}
+                  </span>
+                </div>
+
+                <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
+                  <span className="text-[10px] text-slate-500 uppercase block font-sans">Video Track</span>
                   <span className="text-xs font-semibold text-white flex items-center gap-1 mt-0.5">
                     {report.activeVideoTrack?.readyState === 'live' ? (
                       <Video className="h-3.5 w-3.5 text-emerald-400 shrink-0" />
@@ -370,6 +398,115 @@ export function DiagnosticsModal({
                         ? `${report.audioQuality.voicedSeconds.toFixed(1)} s / 1.5 s`
                         : 'N/A'}
                     </strong>
+                  </div>
+                </div>
+              </div>
+
+              {/* Audio Hardware & Speech Engine Diagnostics Section (§M5) */}
+              <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-indigo-400 font-sans flex items-center gap-1.5">
+                    <Mic className="h-4 w-4" /> Audio Hardware & Speech Engine Diagnostics (§M5)
+                  </span>
+                  <Badge
+                    variant="outline"
+                    className={`text-[10px] ${
+                      report.audioDiagnostics.speechRecognitionSupported
+                        ? 'border-emerald-700/60 text-emerald-400 bg-emerald-950/20'
+                        : 'border-amber-700/60 text-amber-400 bg-amber-950/20'
+                    }`}
+                  >
+                    {report.audioDiagnostics.speechRecognitionSupported
+                      ? 'SpeechRecognition: Supported'
+                      : 'SpeechRecognition: Unsupported'}
+                  </Badge>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-slate-300">
+                  <div>
+                    <span className="text-slate-500 block text-[10px]">Mic Permission:</span>
+                    <strong className="text-white text-xs">{report.microphonePermission}</strong>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 block text-[10px]">AudioContext State:</span>
+                    <strong
+                      className={`text-xs ${
+                        report.audioDiagnostics.audioContextState === 'running'
+                          ? 'text-emerald-400'
+                          : 'text-slate-300'
+                      }`}
+                    >
+                      {report.audioDiagnostics.audioContextState}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 block text-[10px]">Last getUserMedia Error:</span>
+                    <strong
+                      className="text-rose-400 text-xs truncate block"
+                      title={report.audioDiagnostics.lastGetUserMediaError || 'None'}
+                    >
+                      {report.audioDiagnostics.lastGetUserMediaError || 'None'}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="text-slate-500 block text-[10px]">Last STT Error:</span>
+                    <strong
+                      className="text-rose-400 text-xs truncate block"
+                      title={report.audioDiagnostics.lastSpeechRecognitionError || 'None'}
+                    >
+                      {report.audioDiagnostics.lastSpeechRecognitionError || 'None'}
+                    </strong>
+                  </div>
+                </div>
+
+                {/* Active Audio Track & Settings */}
+                {report.audioDiagnostics.activeAudioTrack ? (
+                  <div className="pt-2 border-t border-slate-900 space-y-1 text-slate-400">
+                    <div className="flex items-center justify-between text-xs">
+                      <span>
+                        Active Mic Track: <span className="text-white">{report.audioDiagnostics.activeAudioTrack.label}</span>
+                      </span>
+                      <span
+                        className={
+                          report.audioDiagnostics.isAudioTrackMutedOrEnded
+                            ? 'text-rose-400'
+                            : 'text-emerald-400'
+                        }
+                      >
+                        {report.audioDiagnostics.isAudioTrackMutedOrEnded
+                          ? '⚠️ Track Muted or Ended'
+                          : '✓ Live & Unmuted'}
+                      </span>
+                    </div>
+                    {report.audioDiagnostics.activeAudioTrack.settings &&
+                      Object.keys(report.audioDiagnostics.activeAudioTrack.settings).length > 0 && (
+                        <pre className="p-2 rounded bg-slate-900 border border-slate-800/80 text-[11px] text-slate-300 overflow-x-auto">
+                          {JSON.stringify(report.audioDiagnostics.activeAudioTrack.settings, null, 2)}
+                        </pre>
+                      )}
+                  </div>
+                ) : (
+                  <p className="pt-1 text-[11px] text-slate-500 border-t border-slate-900">
+                    No active audio track stream acquired.
+                  </p>
+                )}
+
+                {/* Audio Input Devices */}
+                <div className="pt-1 border-t border-slate-900">
+                  <span className="text-[10px] text-slate-500 block mb-1">
+                    Detected Audio Inputs ({report.audioDiagnostics.audioInputs.length}):
+                  </span>
+                  <div className="space-y-1 max-h-24 overflow-y-auto">
+                    {report.audioDiagnostics.audioInputs.map((input, idx) => (
+                      <div
+                        key={input.deviceId || idx}
+                        className="text-[11px] text-slate-300 flex items-center justify-between"
+                      >
+                        <span className="truncate max-w-sm">{input.label}</span>
+                        <span className="text-[10px] font-mono text-slate-500">
+                          {input.isDeviceIdEmpty ? 'ID: (empty)' : `ID: ${input.deviceId.slice(0, 8)}...`}
+                        </span>
+                      </div>
+                    ))}
                   </div>
                 </div>
               </div>

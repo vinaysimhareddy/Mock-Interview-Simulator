@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
 
 from app.api.deps import get_current_user
 from app.models.interview import AnswerSubmission, FinalReport, InterviewStepResponse, QuestionEvaluation
@@ -62,7 +63,7 @@ async def start_interview_endpoint(
         difficulty=session_doc.get("difficulty", "Adaptive"),
         resume_summary=resume_summary,
         target_skills=target_skills,
-        max_questions=5,
+        max_questions=session_doc.get("max_questions") or 9999,
     )
 
     await session_repo.update_interview_state(
@@ -83,6 +84,8 @@ async def start_interview_endpoint(
         next_question=state.get("current_question"),
         difficulty=state["difficulty"],
         difficulty_change=state.get("difficulty_change"),
+        current_action=state.get("current_action"),
+        question_sources=state.get("question_sources"),
     )
 
 
@@ -182,18 +185,21 @@ async def submit_answer_endpoint(
             final_score=float(final_score) if final_score is not None else None,
         )
 
-    last_eval = updated_state.get("evaluation")
-
+    # Per UX security & anti-bias requirements: withhold per-answer scores/critiques from client mid-interview.
+    # Evaluations are stored in updated_state["evaluations_history"] in MongoDB and exposed only in the final report.
+    eval_dict = updated_state.get("evaluation")
     return InterviewStepResponse(
         session_id=session_id,
         status=new_status,
         current_question_index=updated_state["current_question_index"],
         max_questions=updated_state["max_questions"],
-        evaluation=QuestionEvaluation(**last_eval) if last_eval is not None else None,
+        evaluation=QuestionEvaluation(**eval_dict) if eval_dict else None,
         next_question=updated_state.get("current_question") if not updated_state["is_finished"] else None,
         difficulty=updated_state["difficulty"],
         difficulty_change=updated_state.get("difficulty_change"),
         final_report=FinalReport(**final_report_dict) if final_report_dict is not None else None,
+        current_action=updated_state.get("current_action"),
+        question_sources=updated_state.get("question_sources"),
     )
 
 
@@ -258,10 +264,77 @@ async def get_interview_state(
         "seniority": session_doc.get("seniority"),
         "difficulty": state.get("difficulty", session_doc.get("difficulty")),
         "current_question_index": state.get("current_question_index", 0),
-        "max_questions": state.get("max_questions", 5),
+        "max_questions": state.get("max_questions", 9999),
         "current_question": state.get("current_question"),
         "evaluations_history": state.get("evaluations_history", []),
         "difficulty_history": state.get("difficulty_history", []),
         "conversation_history": state.get("conversation_history", []),
         "final_report": state.get("final_report"),
     }
+
+
+class EndInterviewRequest(BaseModel):
+    reason: str = Field(
+        default="user_ended",
+        description="Reason: 'time_budget_expired' | 'user_ended' | 'aborted_face_not_visible' | 'aborted_camera_lost'",
+    )
+
+
+@router.post(
+    "/sessions/{session_id}/end",
+    response_model=InterviewStepResponse,
+    summary="Conclude or abort interview session (§3.6, §3.7, Item 9)",
+)
+async def end_interview_endpoint(
+    session_id: str,
+    end_req: EndInterviewRequest,
+    current_user: UserInDB = Depends(get_current_user),
+) -> InterviewStepResponse:
+    """End interview session strictly on time-up, user end, or face/camera policy abort."""
+    session_doc = await session_repo.get_by_id_and_user(session_id, current_user.id)
+    if not session_doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found.")
+
+    state = session_doc.get("interview_state")
+    if not state:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Session has not started.")
+
+    is_abort = end_req.reason.startswith("aborted_")
+    new_status = "ABORTED" if is_abort else "COMPLETED"
+
+    # Run LangGraph end_interview_node to generate final scorecard
+    from app.services.interview_engine import end_interview_node
+    end_res = await end_interview_node(state)
+    state.update(end_res)
+    state["is_finished"] = True
+    final_report_dict = state.get("final_report")
+
+    await session_repo.update_interview_state(
+        session_id=session_id,
+        state=state,
+        extra_fields={
+            "status": new_status,
+            "session_status": new_status.lower(),
+            "ended_at": datetime.now(timezone.utc),
+            "end_reason": end_req.reason,
+        },
+    )
+
+    if final_report_dict:
+        await evaluation_repo.create_or_update(
+            session_id=session_id,
+            user_id=current_user.id,
+            report=final_report_dict,
+            final_score=float(final_report_dict.get("overall_score", 0)),
+        )
+
+    return InterviewStepResponse(
+        session_id=session_id,
+        status=new_status,
+        current_question_index=state["current_question_index"],
+        max_questions=state.get("max_questions", 9999),
+        evaluation=None,
+        next_question=None,
+        difficulty=state.get("difficulty", "Medium"),
+        final_report=FinalReport(**final_report_dict) if final_report_dict else None,
+    )
