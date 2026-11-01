@@ -174,6 +174,18 @@ async def submit_answer_endpoint(
         extra_fields=extra_update,
     )
 
+    # Persist the structured turn to session document in MongoDB (§Q7)
+    if updated_state.get("turns_history"):
+        latest_turn = updated_state["turns_history"][-1]
+        try:
+            await session_repo.record_turn(
+                session_id=session_id,
+                user_id=current_user.id,
+                turn=latest_turn,
+            )
+        except Exception as exc:
+            logger.warning("Failed to record turn to session document: %s", exc)
+
     # Persist final report to evaluations collection if interview has finished (§M4)
     final_report_dict: Optional[Dict[str, Any]] = updated_state.get("final_report")
     if updated_state["is_finished"] and final_report_dict is not None:
@@ -193,7 +205,7 @@ async def submit_answer_endpoint(
         status=new_status,
         current_question_index=updated_state["current_question_index"],
         max_questions=updated_state["max_questions"],
-        evaluation=QuestionEvaluation(**eval_dict) if eval_dict else None,
+        evaluation=QuestionEvaluation(**eval_dict) if (updated_state.get("is_finished") and eval_dict) else None,
         next_question=updated_state.get("current_question") if not updated_state["is_finished"] else None,
         difficulty=updated_state["difficulty"],
         difficulty_change=updated_state.get("difficulty_change"),

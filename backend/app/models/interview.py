@@ -82,6 +82,30 @@ class IntegritySummary(BaseModel):
     )
 
 
+class QuestionCoverageItem(BaseModel):
+    """Detailed metadata for an individual question turn in the final report (§Q7)."""
+    question_index: int
+    question: str
+    candidate_answer: str = ""
+    planner_action: str
+    target_topic: str
+    source_description: str
+    sources_used: List[Dict[str, Any]] = Field(default_factory=list)
+    difficulty_tier: float
+    difficulty_label: str
+    score: Optional[float] = None
+    feedback: Optional[str] = None
+
+
+class DifficultyProgressionPoint(BaseModel):
+    """Point on the candidate difficulty progression timeline (§Q7)."""
+    question_index: int
+    difficulty_tier: float
+    difficulty_label: str
+    score: Optional[float] = None
+    change: Optional[str] = None  # "UPGRADE" | "DOWNGRADE" | "UNCHANGED"
+
+
 class FinalReport(BaseModel):
     """Comprehensive post-interview scorecard."""
     overall_score: float = Field(..., ge=0.0, le=100.0)
@@ -93,6 +117,14 @@ class FinalReport(BaseModel):
     integrity_summary: Optional[IntegritySummary] = Field(
         default=None,
         description="Formal camera integrity and biometric verification report section (§7)",
+    )
+    question_coverage: List[QuestionCoverageItem] = Field(
+        default_factory=list,
+        description="Detailed record of all asked questions, their sources, evaluated difficulty, and candidate performance (§Q7)",
+    )
+    difficulty_progression: List[DifficultyProgressionPoint] = Field(
+        default_factory=list,
+        description="Timeline of difficulty tier progression throughout the interview (§Q7)",
     )
 
 

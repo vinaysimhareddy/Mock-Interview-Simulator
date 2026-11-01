@@ -146,6 +146,20 @@ class SessionRepository:
             {"$push": {"transcript": turn}},
         )
 
+    async def record_turn(
+        self, session_id: str, user_id: str, turn: Dict[str, Any]
+    ) -> None:
+        """Push a structured Q&A turn record to the session document in MongoDB (§Q7)."""
+        now = datetime.now(timezone.utc)
+        turn_with_time = {**turn, "created_at": now}
+        await self.collection.update_one(
+            {"_id": session_id},
+            {
+                "$push": {"turns": turn_with_time},
+                "$set": {"updated_at": now},
+            },
+        )
+
     async def push_telemetry_summary(
         self, session_id: str, summary_points: List[Dict[str, Any]]
     ) -> None:

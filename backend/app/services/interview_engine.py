@@ -14,7 +14,14 @@ from app.core.seniority_profiles import (
     get_difficulty_label,
     get_seniority_profile,
 )
-from app.models.interview import CategoryScores, FinalReport, IntegritySummary, QuestionEvaluation
+from app.models.interview import (
+    CategoryScores,
+    DifficultyProgressionPoint,
+    FinalReport,
+    IntegritySummary,
+    QuestionCoverageItem,
+    QuestionEvaluation,
+)
 from app.repositories.knowledge_base_repo import knowledge_base_repo
 from app.repositories.resume_repo import resume_repo
 from app.services.difficulty_classifier import classify_difficulty
@@ -81,6 +88,7 @@ class InterviewState(TypedDict):
     question_sources: List[Dict[str, Any]]
     validation_feedback: Optional[str]
     generation_attempts: int
+    turns_history: List[Dict[str, Any]]
 
 
 def _get_llm():
@@ -359,7 +367,7 @@ async def plan_turn_node(state: InterviewState) -> Dict[str, Any]:
         }
 
     if last_score >= 8.0:
-        # Strong answer -> go one level deeper
+        # Strong answer -> deepen
         return {
             "current_action": "deepen",
             "target_topic": current_topic or "Architecture",
@@ -367,9 +375,9 @@ async def plan_turn_node(state: InterviewState) -> Dict[str, Any]:
             "consecutive_followups": consecutive + 1,
         }
 
-    # Check for specific technology claims in answer
+    # Check for specific technology claims in answer -> probe
     extracted = extract_tags_from_text(last_answer)
-    if extracted and last_score >= 5.0:
+    if extracted:
         probe_target = extracted[0]
         return {
             "current_action": "follow_up_probe",
@@ -378,8 +386,8 @@ async def plan_turn_node(state: InterviewState) -> Dict[str, Any]:
             "consecutive_followups": consecutive + 1,
         }
 
-    if len(answer_words) < 15 and not is_uncertain:
-        # Vague or brief response
+    if len(answer_words) < 20 and not is_uncertain:
+        # Vague or brief response without specific claims
         return {
             "current_action": "follow_up_clarify",
             "target_topic": current_topic or "Implementation Details",
@@ -772,8 +780,6 @@ def _heuristic_evaluate(answer: str, seniority: str, telemetry: Dict[str, Any]) 
         "database", "latency", "throughput", "schema", "resilience", "microservices",
         "trade-off", "tradeoff", "scalability", "metric", "partition", "lock",
         "acid", "api", "rest", "docker", "redis", "postgres", "kafka", "testing",
-        "fastapi", "sqlalchemy", "pool", "async", "engine", "replica", "replication",
-        "sql", "nosql", "orm", "routing", "pipeline", "alembic", "monitoring",
     ]
     keywords_found = sum(1 for kw in tech_keywords if kw in answer_lower)
 
@@ -783,19 +789,19 @@ def _heuristic_evaluate(answer: str, seniority: str, telemetry: Dict[str, Any]) 
         clarity = 3.0
         completeness = 2.0
         feedback = "Answer is too brief and lacks technical substance. Please elaborate with architectural specifics."
-    elif keywords_found >= 3 and word_count >= 30:
+    elif keywords_found >= 4 and word_count >= 40:
         score = 9.0
         tech_acc = 9.2
         clarity = 8.8
         completeness = 9.0
         feedback = "Excellent response demonstrating depth, concrete terminology, and strong architectural reasoning."
-    elif keywords_found >= 1 and word_count >= 15:
+    elif keywords_found >= 2 and word_count >= 15:
         score = 7.5
         tech_acc = 7.5
         clarity = 7.8
         completeness = 7.2
-        feedback = "Solid answer covering practical implementation details; could go deeper into failure modes."
-    elif word_count < 25:
+        feedback = "Solid answer covering key technical concepts; could elaborate further on edge cases."
+    elif word_count < 20:
         score = 4.5
         tech_acc = 4.0
         clarity = 5.0
@@ -823,8 +829,32 @@ def _heuristic_evaluate(answer: str, seniority: str, telemetry: Dict[str, Any]) 
     }
 
 
+def _format_source_description(action: str, topic: str, sources: List[Dict[str, Any]]) -> str:
+    """Format human-readable source attribution string for question coverage report (§Q7)."""
+    if action == "new_topic_from_resume":
+        resume_sources = [s for s in sources if s.get("source") == "resume"]
+        if resume_sources:
+            return f"Grounded in Resume: {resume_sources[0].get('title', topic)}"
+        return f"Grounded in Resume: {topic}"
+    elif action in ("follow_up_probe", "follow_up_clarify"):
+        return f"Adaptive follow-up: {topic}"
+    elif action == "deepen":
+        return f"Adaptive depth probe: {topic}"
+    elif action == "simplify_and_bridge":
+        return f"Adaptive simplification & bridge: {topic}"
+    elif action == "behavioral":
+        return f"Role Competency & Behavioral: {topic}"
+    elif action == "wrap_up":
+        return "Session Conclusion & Candidate Q&A"
+    else:  # new_topic_from_role
+        kb_sources = [s for s in sources if s.get("source") == "knowledge_base"]
+        if kb_sources:
+            return f"Knowledge Base: {kb_sources[0].get('title', topic)}"
+        return f"Knowledge Base: {topic}"
+
+
 async def update_summary_node(state: InterviewState) -> Dict[str, Any]:
-    """LangGraph node: append the turn's Q&A and evaluation to rolling summary (§Q5)."""
+    """LangGraph node: append the turn's Q&A and evaluation to rolling summary and turns history (§Q5, §Q7)."""
     index = state.get("current_question_index", 1)
     action = state.get("current_action", "unknown")
     topic = state.get("current_topic", "General")
@@ -852,9 +882,32 @@ async def update_summary_node(state: InterviewState) -> Dict[str, Any]:
     if topic and topic not in covered:
         covered.append(topic)
 
+    # Record structured turn for persistence and final report (§Q7)
+    turn_record: Dict[str, Any] = {
+        "question_index": index,
+        "question": question,
+        "candidate_answer": answer,
+        "planner_action": action,
+        "target_topic": topic,
+        "sources_used": state.get("question_sources", []),
+        "source_description": _format_source_description(action, topic, state.get("question_sources", [])),
+        "difficulty_tier": float(state.get("numeric_difficulty", 2.0)),
+        "difficulty_label": state.get("difficulty", "Medium"),
+        "difficulty_change": state.get("difficulty_change", "UNCHANGED"),
+        "score": score,
+        "feedback": feedback,
+        "technical_accuracy": eval_data.get("technical_accuracy"),
+        "clarity": eval_data.get("clarity"),
+        "completeness": eval_data.get("completeness"),
+    }
+
+    turns = list(state.get("turns_history", []))
+    turns.append(turn_record)
+
     return {
         "rolling_summary": new_rolling,
         "covered_topics": covered,
+        "turns_history": turns,
     }
 
 
@@ -974,6 +1027,38 @@ async def end_interview_node(state: InterviewState) -> Dict[str, Any]:
         IntegritySummary(**integrity_summary_dict) if integrity_summary_dict else None
     )
 
+    # Build Question Coverage & Difficulty Progression (§Q7)
+    turns = state.get("turns_history", [])
+    question_coverage: List[QuestionCoverageItem] = []
+    difficulty_progression: List[DifficultyProgressionPoint] = []
+
+    for t in turns:
+        q_item = QuestionCoverageItem(
+            question_index=t.get("question_index", 1),
+            question=t.get("question", ""),
+            candidate_answer=t.get("candidate_answer", ""),
+            planner_action=t.get("planner_action", "unknown"),
+            target_topic=t.get("target_topic", "General"),
+            source_description=t.get("source_description") or _format_source_description(
+                t.get("planner_action", ""), t.get("target_topic", ""), t.get("sources_used", [])
+            ),
+            sources_used=t.get("sources_used", []),
+            difficulty_tier=float(t.get("difficulty_tier", 2.0)),
+            difficulty_label=t.get("difficulty_label", "Medium"),
+            score=t.get("score"),
+            feedback=t.get("feedback"),
+        )
+        question_coverage.append(q_item)
+
+        prog_point = DifficultyProgressionPoint(
+            question_index=t.get("question_index", 1),
+            difficulty_tier=float(t.get("difficulty_tier", 2.0)),
+            difficulty_label=t.get("difficulty_label", "Medium"),
+            score=t.get("score"),
+            change=t.get("difficulty_change", "UNCHANGED"),
+        )
+        difficulty_progression.append(prog_point)
+
     report = FinalReport(
         overall_score=overall_score,
         category_scores=CategoryScores(
@@ -989,6 +1074,8 @@ async def end_interview_node(state: InterviewState) -> Dict[str, Any]:
             f"Achieved an overall score of {overall_score}/100 with recommendation: {hiring_decision}."
         ),
         integrity_summary=integrity_summary_obj,
+        question_coverage=question_coverage,
+        difficulty_progression=difficulty_progression,
     )
 
     return {
@@ -1117,6 +1204,7 @@ async def start_interview(
         "question_sources": [],
         "validation_feedback": None,
         "generation_attempts": 0,
+        "turns_history": [],
     }
 
     # Execute generation pipeline: plan -> retrieve -> generate -> validate

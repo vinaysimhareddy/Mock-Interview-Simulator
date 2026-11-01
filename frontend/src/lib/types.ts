@@ -197,6 +197,28 @@ export interface IntegritySummary {
   disclaimer: string;
 }
 
+export interface QuestionCoverageItem {
+  question_index: number;
+  question: string;
+  candidate_answer: string;
+  planner_action: string;
+  target_topic: string;
+  source_description: string;
+  sources_used?: Array<{ source: string; id?: string; title?: string; snippet?: string }>;
+  difficulty_tier: number;
+  difficulty_label: string;
+  score?: number;
+  feedback?: string;
+}
+
+export interface DifficultyProgressionPoint {
+  question_index: number;
+  difficulty_tier: number;
+  difficulty_label: string;
+  score?: number;
+  change?: 'UPGRADE' | 'DOWNGRADE' | 'UNCHANGED';
+}
+
 export interface FinalReport {
   overall_score: number;
   category_scores: {
@@ -209,5 +231,7 @@ export interface FinalReport {
   weaknesses: string[];
   executive_summary: string;
   integrity_summary?: IntegritySummary;
+  question_coverage?: QuestionCoverageItem[];
+  difficulty_progression?: DifficultyProgressionPoint[];
 }
 

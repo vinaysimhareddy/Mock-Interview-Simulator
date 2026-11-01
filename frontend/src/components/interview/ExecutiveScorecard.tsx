@@ -9,6 +9,14 @@ import {
   ArrowLeft,
   Loader2,
   Sparkles,
+  TrendingUp,
+  Layers,
+  FileText,
+  Database,
+  GitBranch,
+  ArrowUpRight,
+  ArrowDownRight,
+  Minus,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from '@/components/ui/card';
@@ -242,6 +250,155 @@ export function ExecutiveScorecard({
             <span className="font-semibold text-foreground block text-sm">Executive Summary:</span>
             <p className="leading-relaxed">{report.executive_summary}</p>
           </div>
+
+          {/* Adaptive Difficulty Progression Timeline (§Q7) */}
+          {report.difficulty_progression && report.difficulty_progression.length > 0 && (
+            <div className="p-5 rounded-2xl bg-muted/30 border border-border space-y-3" data-testid="difficulty-progression-timeline">
+              <div className="flex items-center gap-2">
+                <div className="p-1.5 rounded-lg bg-primary/10 border border-primary/20 text-primary">
+                  <TrendingUp className="h-4 w-4" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-bold text-foreground">Adaptive Difficulty Progression</h4>
+                  <p className="text-[11px] text-muted-foreground">
+                    Dynamically adjusted per turn based on candidate answer technical accuracy and depth
+                  </p>
+                </div>
+              </div>
+
+              {/* Stepper Timeline */}
+              <div className="flex flex-wrap items-center gap-2 pt-2">
+                {report.difficulty_progression.map((p, idx) => (
+                  <React.Fragment key={idx}>
+                    <div className="flex items-center gap-1.5 p-2 rounded-xl bg-card border border-border/80 text-xs">
+                      <span className="font-semibold text-muted-foreground font-mono">Q{p.question_index}</span>
+                      <span className="px-2 py-0.5 rounded-full font-medium text-[11px] bg-primary/15 text-primary">
+                        {p.difficulty_label} ({p.difficulty_tier.toFixed(1)})
+                      </span>
+                      {p.change === 'UPGRADE' && (
+                        <span className="flex items-center text-emerald-400 font-semibold text-[10px] gap-0.5" title="Stepped up difficulty">
+                          <ArrowUpRight className="h-3.5 w-3.5" />
+                        </span>
+                      )}
+                      {p.change === 'DOWNGRADE' && (
+                        <span className="flex items-center text-amber-400 font-semibold text-[10px] gap-0.5" title="Stepped down difficulty">
+                          <ArrowDownRight className="h-3.5 w-3.5" />
+                        </span>
+                      )}
+                      {p.change === 'UNCHANGED' && (
+                        <span className="text-muted-foreground/60 text-[10px]" title="Maintained difficulty">
+                          <Minus className="h-3 w-3" />
+                        </span>
+                      )}
+                    </div>
+                    {idx < (report.difficulty_progression?.length ?? 0) - 1 && (
+                      <ArrowRight className="h-3 w-3 text-muted-foreground/50 shrink-0" />
+                    )}
+                  </React.Fragment>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Question Coverage & RAG Grounding Audit (§Q7) */}
+          {report.question_coverage && report.question_coverage.length > 0 && (
+            <div className="p-5 rounded-2xl bg-muted/30 border border-border space-y-4" data-testid="question-coverage-section">
+              <div className="flex items-center gap-2 border-b border-border pb-3">
+                <div className="p-1.5 rounded-lg bg-primary/10 border border-primary/20 text-primary">
+                  <Layers className="h-4 w-4" />
+                </div>
+                <div>
+                  <h4 className="text-sm font-bold text-foreground">Question Coverage & Grounding Audit</h4>
+                  <p className="text-[11px] text-muted-foreground">
+                    Verifiable provenance: questions derived from candidate resume, role knowledge base, and adaptive follow-up probes
+                  </p>
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                {report.question_coverage.map((qc, idx) => {
+                  const isResume = qc.source_description.toLowerCase().includes('resume');
+                  const isKB = qc.source_description.toLowerCase().includes('knowledge base');
+                  const isFollowUp = qc.source_description.toLowerCase().includes('follow-up') || qc.source_description.toLowerCase().includes('probe');
+
+                  return (
+                    <div
+                      key={idx}
+                      className="p-3.5 rounded-xl bg-card border border-border/80 space-y-2.5 text-xs transition-all hover:border-border"
+                      data-testid={`question-coverage-item-${qc.question_index}`}
+                    >
+                      {/* Item Header */}
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold text-foreground">Q{qc.question_index}</span>
+                          <span
+                            className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium border ${
+                              isResume
+                                ? 'bg-indigo-950/40 text-indigo-300 border-indigo-700/40'
+                                : isKB
+                                ? 'bg-blue-950/40 text-blue-300 border-blue-700/40'
+                                : isFollowUp
+                                ? 'bg-emerald-950/40 text-emerald-300 border-emerald-700/40'
+                                : 'bg-purple-950/40 text-purple-300 border-purple-700/40'
+                            }`}
+                          >
+                            {isResume ? (
+                              <FileText className="h-3 w-3" />
+                            ) : isKB ? (
+                              <Database className="h-3 w-3" />
+                            ) : (
+                              <GitBranch className="h-3 w-3" />
+                            )}
+                            {qc.source_description}
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-1.5">
+                          <span className="px-2 py-0.5 rounded-md bg-muted/60 text-muted-foreground font-mono text-[11px]">
+                            {qc.difficulty_label} ({qc.difficulty_tier.toFixed(1)})
+                          </span>
+                          {qc.score !== undefined && qc.score !== null && (
+                            <span
+                              className={`px-2 py-0.5 rounded-md font-mono text-[11px] font-semibold ${
+                                qc.score >= 8.0
+                                  ? 'bg-emerald-500/15 text-emerald-400'
+                                  : qc.score >= 5.0
+                                  ? 'bg-blue-500/15 text-blue-400'
+                                  : 'bg-amber-500/15 text-amber-400'
+                              }`}
+                            >
+                              {qc.score.toFixed(1)}/10
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Question Text */}
+                      <div className="text-foreground font-medium text-xs leading-relaxed">
+                        {qc.question}
+                      </div>
+
+                      {/* Candidate Answer Excerpt */}
+                      {qc.candidate_answer && (
+                        <div className="p-2.5 rounded-lg bg-muted/40 border border-border/40 text-[11px] text-muted-foreground leading-relaxed">
+                          <span className="font-semibold text-foreground/80 block mb-0.5">Candidate Response:</span>
+                          "{qc.candidate_answer}"
+                        </div>
+                      )}
+
+                      {/* Feedback */}
+                      {qc.feedback && (
+                        <div className="text-[11px] text-muted-foreground italic">
+                          <span className="font-medium text-foreground/70 not-italic">Evaluation: </span>
+                          {qc.feedback}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* Physical Camera Integrity & Biometric Verification (§7) */}
           <div className="p-5 rounded-2xl bg-muted/30 border border-border space-y-4">
